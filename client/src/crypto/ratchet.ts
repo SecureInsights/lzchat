@@ -1,16 +1,18 @@
 import { base64urlEncode } from "./base64url";
-import { zeroize } from "./bytes";
+import { utf8, zeroize } from "./bytes";
 import { hkdf, seqInfo, sha256 } from "./kdf";
 
 const DEFAULT_REPLAY_WINDOW = 128;
 const DEFAULT_MAX_SKIPPED = 128;
+const MESSAGE_KEY_SALT = utf8("secure-chat/v3/ratchet/message-key/salt");
+const CHAIN_NEXT_SALT = utf8("secure-chat/v3/ratchet/chain-next/salt");
 
 export async function deriveMessageKey(chainKey: Uint8Array, seq: number): Promise<Uint8Array> {
-  return hkdf(chainKey, seqInfo("secure-chat/v3/message-key", seq), null, 32);
+  return hkdf(chainKey, seqInfo("secure-chat/v3/message-key", seq), MESSAGE_KEY_SALT, 32);
 }
 
 export async function deriveNextChainKey(chainKey: Uint8Array, seq: number): Promise<Uint8Array> {
-  return hkdf(chainKey, seqInfo("secure-chat/v3/chain-next", seq), null, 32);
+  return hkdf(chainKey, seqInfo("secure-chat/v3/chain-next", seq), CHAIN_NEXT_SALT, 32);
 }
 
 export async function deriveNonce(messageKey: Uint8Array, kind: string, seq: number, aad: Uint8Array): Promise<Uint8Array> {

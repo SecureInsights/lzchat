@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { derivePairSession, generateSessionKeys } from "../../client/src/crypto/handshake";
+import { derivePairSession, generateSessionKeys, importPeerPublicKey } from "../../client/src/crypto/handshake";
 import { deriveRoomSecrets, type InviteSecret } from "../../client/src/crypto/room";
 import { base64urlEncode } from "../../client/src/crypto/base64url";
 import { ReceiveRatchet, SendRatchet } from "../../client/src/crypto/ratchet";
@@ -16,6 +16,11 @@ const secret: InviteSecret = {
 };
 
 describe("pairwise crypto", () => {
+  it("rejects invalid P-256 public points through WebCrypto", async () => {
+    const zeroPoint = base64urlEncode(new Uint8Array([4, ...new Uint8Array(64)]));
+    await expect(importPeerPublicKey(zeroPoint)).rejects.toThrow();
+  });
+
   it("decrypts sealed payload and rejects AAD tampering", async () => {
     const room = await deriveRoomSecrets(secret);
     const alice = await generateSessionKeys();

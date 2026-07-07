@@ -118,7 +118,7 @@ export class ChatRoom {
       this.#pendingSockets.delete(socket);
       return;
     }
-    if (!existing && this.#clients.size >= MAX_ROOM_MEMBERS) {
+    if (this.#clients.size >= MAX_ROOM_MEMBERS) {
       socket.close(1013, "room_full");
       this.#pendingSockets.delete(socket);
       return;

@@ -43,4 +43,18 @@ describe("room invite", () => {
     expect(opened.roomSeed).toBe(fixtureSecret.roomSeed);
     await expect(unwrapInviteCapsule(capsule, "wrong passphrase")).rejects.toThrow();
   });
+
+  it("supports upgraded invite PBKDF2 iterations", async () => {
+    const capsule = await wrapInviteSecret(fixtureSecret, "correct horse battery staple", { iterations: 600_001 });
+    const opened = await unwrapInviteCapsule(capsule, "correct horse battery staple");
+    expect(capsule.iterations).toBe(600_001);
+    expect(opened.roomSeed).toBe(fixtureSecret.roomSeed);
+  });
+
+  it("rejects downgraded invite PBKDF2 iterations", async () => {
+    const capsule = await wrapInviteSecret(fixtureSecret, "correct horse battery staple");
+    await expect(
+      unwrapInviteCapsule({ ...capsule, iterations: 100_000 }, "correct horse battery staple")
+    ).rejects.toThrow("unsupported invite iterations");
+  });
 });

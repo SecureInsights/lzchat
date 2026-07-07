@@ -95,4 +95,24 @@ describe("envelope validator", () => {
       })
     ).not.toBeNull();
   });
+
+  it("rejects dotted image MIME subtypes", () => {
+    expect(
+      validatePlainPayload({
+        type: "image",
+        mime: "image/x.foo",
+        bytes: "AAA",
+        createdAt: 1
+      })
+    ).toBeNull();
+
+    expect(
+      validatePlainPayload({
+        type: "image",
+        mime: "image/webp",
+        bytes: "AAA",
+        createdAt: 1
+      })
+    ).not.toBeNull();
+  });
 });

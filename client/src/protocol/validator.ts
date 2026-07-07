@@ -197,7 +197,7 @@ export function validatePlainPayload(value: unknown, depth = 0): PlainPayload | 
       }
       return isTimestamp(value.createdAt) ? (value as PlainPayload) : null;
     case "image":
-      if (typeof value.mime !== "string" || !/^image\/[A-Za-z0-9.+-]{1,40}$/u.test(value.mime)) {
+      if (typeof value.mime !== "string" || !/^image\/[A-Za-z0-9+-]{1,40}$/u.test(value.mime)) {
         return null;
       }
       if (!isBase64Token(value.bytes, MAX_IMAGE_BYTES_B64)) {

@@ -23,7 +23,8 @@ export const SECURITY_HEADERS: Record<string, string> = {
 export function applySecurityHeaders(res: ServerResponse, options: { upgradeInsecureRequests?: boolean } = {}): void {
   for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
     if (name === "Content-Security-Policy" && options.upgradeInsecureRequests) {
-      res.setHeader(name, `${value}; upgrade-insecure-requests`);
+      const strictConnectSrc = value.replace("connect-src 'self' ws: wss:", "connect-src 'self' wss:");
+      res.setHeader(name, `${strictConnectSrc}; upgrade-insecure-requests`);
     } else {
       res.setHeader(name, value);
     }

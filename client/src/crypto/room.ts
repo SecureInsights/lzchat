@@ -50,7 +50,24 @@ export type RoomSecrets = {
   fileKey: Uint8Array;
 };
 
-const INVITE_PBKDF2_ITERATIONS = 600_000;
+export const INVITE_PBKDF2_DEFAULT_ITERATIONS = 600_000;
+export const INVITE_PBKDF2_MIN_ITERATIONS = 600_000;
+export const INVITE_PBKDF2_MAX_ITERATIONS = 5_000_000;
+
+const ROOM_SECRET_SALT = utf8("secure-chat/v3/room-secret/salt");
+const ROOM_ID_SALT = utf8("secure-chat/v3/room-id/salt");
+
+function normalizeInviteIterations(iterations: number | undefined): number {
+  const value = iterations ?? INVITE_PBKDF2_DEFAULT_ITERATIONS;
+  if (
+    !Number.isSafeInteger(value) ||
+    value < INVITE_PBKDF2_MIN_ITERATIONS ||
+    value > INVITE_PBKDF2_MAX_ITERATIONS
+  ) {
+    throw new Error("unsupported invite iterations");
+  }
+  return value;
+}
 
 export function createInviteSecret(options?: Partial<Omit<InviteSecret, "v" | "roomSeed" | "createdAt">>): InviteSecret {
   return {
@@ -83,13 +100,17 @@ export function createSingleLinkInvite(secret = createInviteSecret()): SingleLin
   return { v: 3, mode: "single-link", secret };
 }
 
-export async function wrapInviteSecret(secret: InviteSecret, passphrase: string): Promise<InviteCapsule> {
+export async function wrapInviteSecret(
+  secret: InviteSecret,
+  passphrase: string,
+  options: { iterations?: number } = {}
+): Promise<InviteCapsule> {
   if (passphrase.trim().length < 10) {
     throw new Error("passphrase too short");
   }
   const salt = randomBytes(16);
   const nonce = randomBytes(12);
-  const iterations = INVITE_PBKDF2_ITERATIONS;
+  const iterations = normalizeInviteIterations(options.iterations);
   const passKey = await pbkdf2Sha256(passphrase, salt, iterations);
   const inviteKey = await hkdf(passKey, "secure-chat/v3/invite-wrap", salt, 32);
   const ct = await aesGcmEncrypt(inviteKey, nonce, utf8("invite-v3"), utf8(stableJson(secret)));
@@ -112,10 +133,7 @@ export async function unwrapInviteCapsule(capsule: InviteCapsule, passphrase: st
   }
   const salt = base64urlDecode(capsule.salt);
   const nonce = base64urlDecode(capsule.nonce);
-  const iterations = capsule.iterations ?? INVITE_PBKDF2_ITERATIONS;
-  if (iterations !== INVITE_PBKDF2_ITERATIONS) {
-    throw new Error("unsupported invite iterations");
-  }
+  const iterations = normalizeInviteIterations(capsule.iterations);
   const passKey = await pbkdf2Sha256(passphrase, salt, iterations);
   const inviteKey = await hkdf(passKey, "secure-chat/v3/invite-wrap", salt, 32);
   try {
@@ -146,11 +164,11 @@ export async function deriveRoomSecrets(secret: InviteSecret): Promise<RoomSecre
   if (roomSeed.length !== 32) {
     throw new Error("roomSeed must be 32 bytes");
   }
-  const roomSecret = await hkdf(roomSeed, "secure-chat/v3/room-secret", null, 32);
-  const roomIdBytes = await hkdf(roomSecret, "secure-chat/v3/room-id", null, 16);
-  const roomPsk = await hkdf(roomSecret, "secure-chat/v3/room-psk", null, 32);
-  const rosterKey = await hkdf(roomSecret, "secure-chat/v3/roster-key", null, 32);
-  const fileKey = await hkdf(roomSecret, "secure-chat/v3/file-domain", null, 32);
+  const roomSecret = await hkdf(roomSeed, "secure-chat/v3/room-secret", ROOM_SECRET_SALT, 32);
+  const roomIdBytes = await hkdf(roomSecret, "secure-chat/v3/room-id", ROOM_ID_SALT, 16);
+  const roomPsk = await hkdf(roomSecret, "secure-chat/v3/room-psk", roomIdBytes, 32);
+  const rosterKey = await hkdf(roomSecret, "secure-chat/v3/roster-key", roomIdBytes, 32);
+  const fileKey = await hkdf(roomSecret, "secure-chat/v3/file-domain", roomIdBytes, 32);
   return {
     roomSeed,
     roomSecret,

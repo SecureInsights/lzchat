@@ -4,7 +4,7 @@ export const CSP = [
   "style-src 'self'",
   "img-src 'self' data: blob:",
   "font-src 'self'",
-  "connect-src 'self' ws: wss:",
+  "connect-src 'self' wss:",
   "object-src 'none'",
   "base-uri 'none'",
   "frame-ancestors 'none'",

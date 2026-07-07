@@ -39,10 +39,13 @@
 
 ## 协议说明
 
-1. 邀请 KDF 的当前实现为 WebCrypto 原生 `PBKDF2-SHA256`，迭代数 600,000。这样可以避免为了 Argon2id 引入运行时 WASM/CDN。协议类型保留 `argon2id`，后续可在锁定 WASM 依赖和审计 lockfile 后切换。
+1. 邀请 KDF 的当前实现为 WebCrypto 原生 `PBKDF2-SHA256`，默认迭代数 600,000，并允许后续 capsule 使用更高迭代数。这样可以避免为了 Argon2id 引入运行时 WASM/CDN。协议类型保留 `argon2id`，后续可在锁定 WASM 依赖和审计 lockfile 后切换。
 2. 本地 Node relay 使用原生 HTTP upgrade 和 WebSocket 帧解析。部署形态仍保留 Cloudflare Worker/Durable Object；本地 smoke 不依赖 `ws` 包安装。
 3. 接收 ratchet 在解密失败时会把未接受的 skipped key 放回窗口，避免攻击者用未来序号坏密文让接收端永久失步。
-4. 当前 ratchet 提供会话内消息链前向安全：泄露当前 chain key 不能反推已擦除的历史 message key。但它不是完整 Double Ratchet；如果同时泄露房间秘密、会话私钥并掌握历史密文，历史消息风险会显著上升。
+4. HKDF 调用必须显式传入 salt；房间派生使用固定 domain salt，消息 ratchet 使用独立 domain salt，pairwise/nonce 派生使用 room/transcript/AAD 上下文 salt。
+5. 当前 ratchet 提供会话内消息链前向安全：泄露当前 chain key 不能反推已擦除的历史 message key。但它不是完整 Double Ratchet；如果同时泄露房间秘密、会话私钥并掌握历史密文，历史消息风险会显著上升。
+
+注意：HKDF salt 硬化会改变新版本的房间派生结果，旧版本生成的邀请链接不保证能与新版本互通。
 
 ## 安装与运行
 

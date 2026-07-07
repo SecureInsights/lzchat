@@ -224,7 +224,7 @@ class Room {
       socket.close(1008, "duplicate_client_id");
       return null;
     }
-    if (!existing && this.clients.size >= MAX_ROOM_MEMBERS) {
+    if (this.clients.size >= MAX_ROOM_MEMBERS) {
       socket.close(1013, "room_full");
       return null;
     }

@@ -4,6 +4,13 @@ export function removeChildren(node: Node): void {
   }
 }
 
+const DATASET_KEY_RE = /^[a-z][A-Za-z0-9]{0,63}$/u;
+const BLOCKED_DATASET_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+export function isSafeDatasetKey(key: string): boolean {
+  return DATASET_KEY_RE.test(key) && !BLOCKED_DATASET_KEYS.has(key);
+}
+
 export function text(value: string): Text {
   return document.createTextNode(value);
 }
@@ -54,6 +61,9 @@ export function el<K extends keyof HTMLElementTagNameMap>(
 }
 
 export function setDataset(node: HTMLElement, key: string, value: string): void {
+  if (!isSafeDatasetKey(key)) {
+    throw new Error("unsafe dataset key");
+  }
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(value)) {
     throw new Error("unsafe dataset value");
   }

@@ -23,15 +23,18 @@ export async function hmacSha256(key: Uint8Array, data: Uint8Array | string): Pr
 export async function hkdf(
   ikm: Uint8Array,
   info: string | Uint8Array,
-  salt: Uint8Array | null,
+  salt: Uint8Array,
   length = 32
 ): Promise<Uint8Array> {
+  if (salt.length === 0) {
+    throw new Error("hkdf salt required");
+  }
   const cryptoKey = await subtle().importKey("raw", asBufferSource(ikm), "HKDF", false, ["deriveBits"]);
   const bits = await subtle().deriveBits(
     {
       name: "HKDF",
       hash: "SHA-256",
-      salt: asBufferSource(salt ?? new Uint8Array(32)),
+      salt: asBufferSource(salt),
       info: asBufferSource(typeof info === "string" ? utf8(info) : info)
     },
     cryptoKey,
