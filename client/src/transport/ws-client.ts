@@ -61,12 +61,13 @@ export class WsClient {
     });
   }
 
-  send(value: unknown): void {
+  send(value: unknown): boolean {
     const socket = this.#socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      return;
+      return false;
     }
     socket.send(JSON.stringify(value));
+    return true;
   }
 
   close(): void {

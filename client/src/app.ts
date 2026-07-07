@@ -1,11 +1,17 @@
 import "./style.css";
+import emojiDataUrl from "emoji-picker-element-data/zh/emojibase/data.json?url";
 import { APP_NAME, BUILD_HASH, PROTOCOL_VERSION, wsUrlForRoom } from "./config";
-import { base64urlEncode } from "./crypto/base64url";
-import { formatSafetyCode, peerFingerprint, roomSafetyCode, rosterDigest } from "./crypto/fingerprint";
-import { derivePairSession, generateSessionKeys, type PairSession, type SessionKeys } from "./crypto/handshake";
+import { base64urlDecode, base64urlEncode } from "./crypto/base64url";
+import { peerFingerprint, roomSafetyCode, rosterDigest } from "./crypto/fingerprint";
+import {
+  derivePairSession,
+  generateSessionKeys,
+  type PairSession,
+  type SessionKeys
+} from "./crypto/handshake";
 import { randomBytes } from "./crypto/random";
 import { ReceiveRatchet, SendRatchet } from "./crypto/ratchet";
-import { zeroize } from "./crypto/bytes";
+import { asBufferSource, concatBytes, zeroize } from "./crypto/bytes";
 import {
   clearLocationFragment,
   createInviteSecret,
@@ -21,8 +27,17 @@ import {
   type RoomSecrets
 } from "./crypto/room";
 import { openPayload, sealPayload } from "./protocol/envelope";
-import type { CapabilitySet, JoinMessage, MembersMessage, PlainPayload, RelayEnvelope, ServerMessage } from "./protocol/types";
+import type {
+  CapabilitySet,
+  JoinMessage,
+  MembersMessage,
+  PlainPayload,
+  RelayEnvelope,
+  RelayKind,
+  ServerMessage
+} from "./protocol/types";
 import { validateRelayEnvelope } from "./protocol/validator";
+import { safeDownload } from "./security/download";
 import { el, removeChildren, setDataset } from "./security/safe-dom";
 import { WsClient } from "./transport/ws-client";
 
@@ -35,7 +50,6 @@ type PeerRuntime = {
   sendRatchet: SendRatchet;
   recvRatchet: ReceiveRatchet;
   fingerprint: string;
-  verified: boolean;
   profileSent: boolean;
   messageWindow: number[];
   decryptFailures: number;
@@ -46,9 +60,16 @@ type ChatMessage = {
   id: string;
   own: boolean;
   author: string;
-  text: string;
+  kind: "text" | "image" | "file";
   createdAt: number;
-  unverified: boolean;
+  scope: "room" | "private";
+  text?: string;
+  imageUrl?: string;
+  imageMime?: string;
+  fileName?: string;
+  fileSize?: number;
+  fileBlob?: Blob;
+  peerName?: string;
 };
 
 type Runtime = {
@@ -61,10 +82,54 @@ type Runtime = {
   capabilities: CapabilitySet;
   ws: WsClient;
   peers: Map<string, PeerRuntime>;
+  pendingRelays: Map<string, RelayEnvelope[]>;
   members: MembersMessage["members"];
   messages: ChatMessage[];
   status: string;
   safetyCode: string;
+  privatePeerId: string | null;
+  inviteLink: string | null;
+  invitePassphrase: string;
+  inviteMode: "single-link" | "two-channel";
+  incomingFiles: Map<string, IncomingFile>;
+};
+
+type DeliveryContext = {
+  targets: PeerRuntime[];
+  scope: "room" | "private";
+  peerName?: string;
+};
+
+type IncomingFile = {
+  fileId: string;
+  from: string;
+  author: string;
+  scope: "room" | "private";
+  peerName?: string;
+  name: string;
+  mime: string;
+  size: number;
+  chunks: number;
+  createdAt: number;
+  parts: Array<Uint8Array | undefined>;
+  received: number;
+  receivedBytes: number;
+  startedAt: number;
+};
+
+type EmojiRecord = {
+  annotation: string;
+  emoji: string;
+  group: number;
+  order: number;
+  emoticon?: string;
+  tags?: string[];
+};
+
+type EmojiCategory = {
+  group: number;
+  icon: string;
+  label: string;
 };
 
 const app = document.querySelector<HTMLElement>("#app");
@@ -83,6 +148,27 @@ const MAX_RENDERED_MESSAGES = 500;
 const PEER_MESSAGE_WINDOW_MS = 10_000;
 const PEER_MAX_MESSAGES_PER_WINDOW = 120;
 const FAILURE_NOTICE_INTERVAL_MS = 5_000;
+const MAX_PENDING_RELAYS_PER_PEER = 32;
+const MAX_INLINE_IMAGE_BYTES = 3 * 1024 * 1024;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+const MAX_FILE_BATCH = 10;
+const MAX_FILE_BATCH_BYTES = 100 * 1024 * 1024;
+const FILE_CHUNK_BYTES = 256 * 1024;
+const FILE_RECEIVE_TIMEOUT_MS = 2 * 60 * 1000;
+const DISPLAY_IMAGE_MIME_RE = /^image\/(?:png|jpeg|jpg|gif|webp|avif|bmp)$/u;
+const EMOJI_CATEGORIES: EmojiCategory[] = [
+  { group: 0, icon: "😀", label: "表情" },
+  { group: 1, icon: "👋", label: "人物" },
+  { group: 3, icon: "🌿", label: "自然" },
+  { group: 4, icon: "🍜", label: "食物" },
+  { group: 5, icon: "✈️", label: "旅行" },
+  { group: 6, icon: "⚽", label: "活动" },
+  { group: 7, icon: "💡", label: "物品" },
+  { group: 8, icon: "❤️", label: "符号" },
+  { group: 9, icon: "🏳️", label: "旗帜" }
+];
+const EMOJI_GRID_LIMIT = 160;
+let emojiDataPromise: Promise<EmojiRecord[]> | null = null;
 
 function isTrustedContext(): boolean {
   return (
@@ -94,11 +180,143 @@ function isTrustedContext(): boolean {
 }
 
 function makePassphrase(): string {
-  return base64urlEncode(randomBytes(18)).match(/.{1,6}/gu)?.join("-") ?? base64urlEncode(randomBytes(18));
+  return (
+    base64urlEncode(randomBytes(18))
+      .match(/.{1,6}/gu)
+      ?.join("-") ?? base64urlEncode(randomBytes(18))
+  );
+}
+
+const RANDOM_ADJECTIVES = [
+  "amber",
+  "bright",
+  "calm",
+  "clear",
+  "fresh",
+  "green",
+  "quiet",
+  "silver",
+  "swift",
+  "violet"
+];
+const RANDOM_NOUNS = [
+  "atlas",
+  "bridge",
+  "harbor",
+  "lantern",
+  "meadow",
+  "orbit",
+  "ridge",
+  "signal",
+  "stone",
+  "wave"
+];
+
+function randomItem(items: readonly string[]): string {
+  return items[randomBytes(1)[0]! % items.length]!;
 }
 
 function randomLabel(prefix: string): string {
-  return `${prefix}-${base64urlEncode(randomBytes(5)).slice(0, 7)}`;
+  const digitBytes = randomBytes(2);
+  const digits = String((digitBytes[0]! * 256 + digitBytes[1]!) % 1000).padStart(3, "0");
+  return `${prefix}-${randomItem(RANDOM_ADJECTIVES)}-${randomItem(RANDOM_NOUNS)}-${digits}`;
+}
+
+function avatarText(name: string): string {
+  const cleaned = name.trim();
+  return (cleaned[0] ?? "?").toUpperCase();
+}
+
+function insertTextAtCursor(input: HTMLTextAreaElement, value: string): void {
+  input.setRangeText(value, input.selectionStart, input.selectionEnd, "end");
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.focus();
+}
+
+function formatBytes(size: number): string {
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function isDisplayImage(file: Blob): boolean {
+  return DISPLAY_IMAGE_MIME_RE.test(file.type);
+}
+
+function mimeOrFallback(value: string): string {
+  return value.trim().slice(0, 120) || "application/octet-stream";
+}
+
+function fileNameOrFallback(file: File): string {
+  return file.name.trim().slice(0, 180) || "attachment.bin";
+}
+
+function incomingFileKey(from: string, fileId: string): string {
+  return `${from}:${fileId}`;
+}
+
+function revokeMessageResources(message: ChatMessage): void {
+  if (message.imageUrl) {
+    URL.revokeObjectURL(message.imageUrl);
+  }
+}
+
+function imageUrlFromBytes(bytes: Uint8Array, mime: string): string {
+  return URL.createObjectURL(new Blob([asBufferSource(bytes)], { type: mime }));
+}
+
+function arrayBufferToBytes(buffer: ArrayBuffer): Uint8Array {
+  return new Uint8Array(buffer);
+}
+
+async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", asBufferSource(bytes)));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+async function loadEmojiData(): Promise<EmojiRecord[]> {
+  if (!emojiDataPromise) {
+    emojiDataPromise = fetch(emojiDataUrl, {
+      cache: "force-cache",
+      credentials: "same-origin"
+    })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error("emoji_data_unavailable");
+        }
+        return response.json() as Promise<EmojiRecord[]>;
+      })
+      .then((records) =>
+        records
+          .filter((record) => typeof record.emoji === "string" && record.emoji.length > 0)
+          .sort((left, right) => left.order - right.order)
+      )
+      .catch((error: unknown) => {
+        emojiDataPromise = null;
+        throw error;
+      });
+  }
+  return emojiDataPromise;
+}
+
+function emojiMatches(record: EmojiRecord, query: string): boolean {
+  if (!query) {
+    return true;
+  }
+  const haystack = [record.annotation, record.emoticon, ...(record.tags ?? [])]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes(query.toLowerCase());
 }
 
 function parseInviteInput(value: string): string {
@@ -134,7 +352,10 @@ function setApp(node: Node): void {
 function pushMessage(state: Runtime, message: ChatMessage): void {
   state.messages.push(message);
   if (state.messages.length > MAX_RENDERED_MESSAGES) {
-    state.messages.splice(0, state.messages.length - MAX_RENDERED_MESSAGES);
+    const removed = state.messages.splice(0, state.messages.length - MAX_RENDERED_MESSAGES);
+    for (const oldMessage of removed) {
+      revokeMessageResources(oldMessage);
+    }
   }
 }
 
@@ -161,8 +382,38 @@ function destroyRuntime(): void {
   zeroize(state.room.rosterKey);
   zeroize(state.room.fileKey);
   state.peers.clear();
+  state.pendingRelays.clear();
+  state.incomingFiles.clear();
+  for (const message of state.messages) {
+    revokeMessageResources(message);
+  }
   state.messages.splice(0);
   runtime = null;
+}
+
+function queuePendingRelay(state: Runtime, envelope: RelayEnvelope): void {
+  const queued = state.pendingRelays.get(envelope.from) ?? [];
+  queued.push(envelope);
+  if (queued.length > MAX_PENDING_RELAYS_PER_PEER) {
+    queued.splice(0, queued.length - MAX_PENDING_RELAYS_PER_PEER);
+  }
+  state.pendingRelays.set(envelope.from, queued);
+}
+
+async function processPendingRelays(): Promise<void> {
+  const state = runtime;
+  if (!state) {
+    return;
+  }
+  for (const [clientId, queued] of [...state.pendingRelays.entries()]) {
+    if (!state.peers.has(clientId)) {
+      continue;
+    }
+    state.pendingRelays.delete(clientId);
+    for (const envelope of queued) {
+      await handleRelay(envelope, false);
+    }
+  }
 }
 
 function acceptPeerRate(peer: PeerRuntime): boolean {
@@ -170,6 +421,15 @@ function acceptPeerRate(peer: PeerRuntime): boolean {
   peer.messageWindow = peer.messageWindow.filter((seen) => now - seen < PEER_MESSAGE_WINDOW_MS);
   peer.messageWindow.push(now);
   return peer.messageWindow.length <= PEER_MAX_MESSAGES_PER_WINDOW;
+}
+
+function pruneIncomingFiles(state: Runtime): void {
+  const now = Date.now();
+  for (const [key, file] of state.incomingFiles) {
+    if (now - file.startedAt > FILE_RECEIVE_TIMEOUT_MS) {
+      state.incomingFiles.delete(key);
+    }
+  }
 }
 
 function setNotice(container: HTMLElement, message: string, isError = false): void {
@@ -198,28 +458,42 @@ function renderLogin(): void {
 
   const screen = el("section", { className: "login-screen" });
   const panel = el("div", { className: "login-panel" });
-  const brand = el("div", { className: "brand" }, [el("span", { className: "brand-mark", text: "S" }), APP_NAME]);
-  const title = el("h1", { text: decodedInvite ? "加入临时加密房间" : "创建临时加密房间" });
-  const desc = decodedInvite ? el("p", { className: "subtle", text: "输入口令后即可进入。" }) : null;
+  const brand = el("div", { className: "brand" }, [
+    el("span", { className: "brand-mark", text: "S" }),
+    APP_NAME
+  ]);
+  const desc = decodedInvite
+    ? el("p", { className: "subtle", text: "输入口令后即可进入。" })
+    : null;
   const form = el("div", { className: "form-grid" });
   const notice = el("div");
 
   const nameInput = el("input", {
     type: "text",
     placeholder: "例如 Alice",
-    value: randomLabel(decodedInvite ? "访客" : "用户")
+    value: randomLabel(decodedInvite ? "guest" : "user")
   });
-  const randomName = el("button", { className: "icon-button", text: "⚄", title: "随机昵称", ariaLabel: "随机昵称" });
+  const randomName = el("button", {
+    className: "icon-button",
+    text: "⚄",
+    title: "随机昵称",
+    ariaLabel: "随机昵称"
+  });
   randomName.addEventListener("click", () => {
-    nameInput.value = randomLabel(decodedInvite ? "访客" : "用户");
+    nameInput.value = randomLabel(decodedInvite ? "guest" : "user");
   });
   const roomInput = el("input", {
     type: "text",
     placeholder: "只在本机显示"
   });
-  const randomRoom = el("button", { className: "icon-button", text: "⚄", title: "随机房间名", ariaLabel: "随机房间名" });
+  const randomRoom = el("button", {
+    className: "icon-button",
+    text: "⚄",
+    title: "随机房间名",
+    ariaLabel: "随机房间名"
+  });
   randomRoom.addEventListener("click", () => {
-    roomInput.value = randomLabel("房间");
+    roomInput.value = randomLabel("room");
   });
   const inviteInput = el("textarea", {
     placeholder: "粘贴邀请链接或 invite token"
@@ -229,7 +503,8 @@ function renderLogin(): void {
   }
   const passInput = el("input", {
     type: "password",
-    placeholder: decodedInvite?.mode === "two-channel" ? "输入另一渠道收到的口令" : "创建时留空自动生成"
+    placeholder:
+      decodedInvite?.mode === "two-channel" ? "输入另一渠道收到的口令" : "创建时留空自动生成"
   });
 
   const modeButtons = el("div", { className: "segmented" });
@@ -253,9 +528,19 @@ function renderLogin(): void {
   modeButtons.append(highButton, normalButton);
 
   form.append(
-    el("label", { className: "field" }, ["昵称", el("div", { className: "input-row" }, [nameInput, randomName])]),
-    el("label", { className: "field" }, ["房间显示名", el("div", { className: "input-row" }, [roomInput, randomRoom])])
+    el("label", { className: "field" }, [
+      "昵称",
+      el("div", { className: "input-row" }, [nameInput, randomName])
+    ])
   );
+  if (!decodedInvite) {
+    form.append(
+      el("label", { className: "field" }, [
+        "房间显示名",
+        el("div", { className: "input-row" }, [roomInput, randomRoom])
+      ])
+    );
+  }
 
   if (decodedInvite) {
     form.append(el("label", { className: "field" }, ["邀请", inviteInput]));
@@ -263,10 +548,16 @@ function renderLogin(): void {
       form.append(el("label", { className: "field" }, ["独立口令", passInput]));
     }
   } else {
-    form.append(el("label", { className: "field" }, ["隐私性", modeButtons]), el("label", { className: "field" }, ["口令", passInput]));
+    form.append(
+      el("label", { className: "field" }, ["隐私性", modeButtons]),
+      el("label", { className: "field" }, ["口令", passInput])
+    );
   }
 
-  const action = el("button", { className: "primary", text: decodedInvite ? "加入房间" : "创建房间" });
+  const action = el("button", {
+    className: "primary",
+    text: decodedInvite ? "加入房间" : "创建房间"
+  });
   action.disabled = !isTrustedContext();
   action.addEventListener("click", () => {
     void (async () => {
@@ -278,7 +569,10 @@ function renderLogin(): void {
         if (decodedInvite || inviteInput.value.trim()) {
           const inviteToken = parseInviteInput(inviteInput.value || pendingInviteToken || "");
           const invite = decodeInvite(inviteToken);
-          const secret = await inviteToSecret(invite, invite.mode === "two-channel" ? passInput.value : undefined);
+          const secret = await inviteToSecret(
+            invite,
+            invite.mode === "two-channel" ? passInput.value : undefined
+          );
           await startRoom({ secret, roomName, displayName, mode: invite.mode });
           return;
         }
@@ -291,8 +585,16 @@ function renderLogin(): void {
         } else {
           shareToken = encodeInvite(createSingleLinkInvite(secret));
         }
-        await startRoom({ secret, roomName, displayName, mode });
-        showInviteDialog(inviteUrl(shareToken), generatedPassphrase, mode);
+        const link = inviteUrl(shareToken);
+        await startRoom({
+          secret,
+          roomName,
+          displayName,
+          mode,
+          inviteLink: link,
+          invitePassphrase: generatedPassphrase
+        });
+        showInviteDialog(link, generatedPassphrase, mode);
       } catch (error) {
         setNotice(notice, error instanceof Error ? error.message : "操作失败", true);
         action.disabled = false;
@@ -302,13 +604,20 @@ function renderLogin(): void {
 
   form.append(action, notice);
   if (!isTrustedContext()) {
-    form.append(el("div", { className: "warning", text: "当前页面不是 HTTPS，也不是 localhost，已禁用生产聊天入口。" }));
+    form.append(
+      el("div", {
+        className: "warning",
+        text: "当前页面不是 HTTPS，也不是 localhost，已禁用生产聊天入口。"
+      })
+    );
   }
   if (decodedInvite?.mode === "single-link") {
-    form.append(el("div", { className: "warning", text: "该邀请为单链接模式，链接包含全部进入秘密。" }));
+    form.append(
+      el("div", { className: "warning", text: "该邀请为单链接模式，链接包含全部进入秘密。" })
+    );
   }
 
-  panel.append(brand, title);
+  panel.append(brand);
   if (desc) {
     panel.append(desc);
   }
@@ -322,6 +631,8 @@ async function startRoom(input: {
   roomName: string;
   displayName: string;
   mode: "single-link" | "two-channel";
+  inviteLink?: string;
+  invitePassphrase?: string;
 }): Promise<void> {
   const room = await deriveRoomSecrets(input.secret);
   const session = await generateSessionKeys();
@@ -370,10 +681,16 @@ async function startRoom(input: {
     capabilities,
     ws,
     peers: new Map(),
+    pendingRelays: new Map(),
+    incomingFiles: new Map(),
     members: [],
     messages: [],
     status: "连接中",
-    safetyCode: "计算中"
+    safetyCode: "计算中",
+    privatePeerId: null,
+    inviteLink: input.inviteLink ?? null,
+    invitePassphrase: input.invitePassphrase ?? "",
+    inviteMode: input.mode
   };
   renderChat();
   ws.connect();
@@ -404,7 +721,11 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     if (!liveIds.has(clientId)) {
       destroyPeer(peer);
       state.peers.delete(clientId);
+      state.pendingRelays.delete(clientId);
     }
+  }
+  if (state.privatePeerId && !state.peers.has(state.privatePeerId)) {
+    state.privatePeerId = null;
   }
   for (const member of message.members) {
     if (member.clientId === state.clientId) {
@@ -415,7 +736,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       continue;
     }
     if (existing && existing.sessionPub !== member.sessionPub) {
-      addSystemMessage(`${existing.displayName} 的会话密钥已变化，需要重新核对安全码。`);
+      addSystemMessage(`${existing.displayName} 的会话密钥已更新。`);
     }
     if (existing) {
       destroyPeer(existing);
@@ -443,7 +764,6 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       sendRatchet,
       recvRatchet,
       fingerprint: await peerFingerprint(state.room.roomId, member.sessionPub),
-      verified: existing && existing.sessionPub === member.sessionPub ? existing.verified : false,
       profileSent: false,
       messageWindow: existing?.messageWindow ?? [],
       decryptFailures: 0,
@@ -452,6 +772,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
   }
   const digest = await rosterDigest(message.members);
   state.safetyCode = await roomSafetyCode(state.room.rosterKey, digest);
+  await processPendingRelays();
   renderChat();
   await sendProfilesToAll();
 }
@@ -480,22 +801,29 @@ async function sendProfilesToAll(): Promise<void> {
       ratchet: peer.sendRatchet,
       payload
     });
-    state.ws.send(envelope);
-    peer.profileSent = true;
+    peer.profileSent = state.ws.send(envelope);
   }
 }
 
-async function handleRelay(envelope: RelayEnvelope): Promise<void> {
+async function handleRelay(envelope: RelayEnvelope, allowQueue = true): Promise<void> {
   const state = runtime;
   if (!state) {
     return;
   }
-  const valid = validateRelayEnvelope(envelope, state.room.roomId, undefined, (clientId) => clientId === state.clientId);
+  const valid = validateRelayEnvelope(
+    envelope,
+    state.room.roomId,
+    undefined,
+    (clientId) => clientId === state.clientId
+  );
   if (!valid || envelope.to !== state.clientId) {
     return;
   }
   const peer = state.peers.get(envelope.from);
   if (!peer) {
+    if (allowQueue) {
+      queuePendingRelay(state, envelope);
+    }
     return;
   }
   if (!acceptPeerRate(peer)) {
@@ -516,17 +844,172 @@ async function handleRelay(envelope: RelayEnvelope): Promise<void> {
     renderChat();
     return;
   }
+  await handlePlainPayload(state, envelope, peer, payload, "room");
+}
+
+async function handlePlainPayload(
+  state: Runtime,
+  envelope: RelayEnvelope,
+  peer: PeerRuntime,
+  payload: PlainPayload,
+  scope: "room" | "private"
+): Promise<void> {
+  if (payload.type === "private") {
+    await handlePlainPayload(state, envelope, peer, payload.inner, "private");
+    return;
+  }
   if (payload.type === "text") {
-    pushMessage(state, {
+    const message: ChatMessage = {
       id: `${envelope.from}:${envelope.seq}`,
       own: false,
       author: peer.displayName,
+      kind: "text",
       text: payload.text,
       createdAt: payload.createdAt,
-      unverified: !peer.verified
-    });
+      scope
+    };
+    if (scope === "private") {
+      message.peerName = peer.displayName;
+    }
+    pushMessage(state, message);
     renderChat();
+    return;
   }
+  if (payload.type === "image") {
+    if (!DISPLAY_IMAGE_MIME_RE.test(payload.mime)) {
+      return;
+    }
+    const bytes = base64urlDecode(payload.bytes);
+    if (bytes.length > MAX_INLINE_IMAGE_BYTES) {
+      addSystemMessage(`${peer.displayName} 发送的图片超过本机预览限制，已丢弃。`);
+      return;
+    }
+    const message: ChatMessage = {
+      id: `${envelope.from}:${envelope.seq}`,
+      own: false,
+      author: peer.displayName,
+      kind: "image",
+      imageUrl: imageUrlFromBytes(bytes, payload.mime),
+      imageMime: payload.mime,
+      createdAt: payload.createdAt,
+      scope
+    };
+    if (scope === "private") {
+      message.peerName = peer.displayName;
+    }
+    pushMessage(state, message);
+    renderChat();
+    return;
+  }
+  if (payload.type === "file-meta") {
+    handleFileMeta(state, peer, payload, scope);
+    return;
+  }
+  if (payload.type === "file-chunk") {
+    handleFileChunk(state, envelope.from, payload);
+    return;
+  }
+  if (payload.type === "file-done") {
+    await handleFileDone(state, envelope.from, payload);
+  }
+}
+
+function handleFileMeta(
+  state: Runtime,
+  peer: PeerRuntime,
+  payload: Extract<PlainPayload, { type: "file-meta" }>,
+  scope: "room" | "private"
+): void {
+  pruneIncomingFiles(state);
+  if (
+    payload.size > MAX_FILE_BYTES ||
+    payload.chunks > Math.ceil(Math.max(payload.size, 1) / FILE_CHUNK_BYTES)
+  ) {
+    addSystemMessage(`${peer.displayName} 发送的文件超过限制，已拒绝接收。`);
+    return;
+  }
+  const incoming: IncomingFile = {
+    fileId: payload.fileId,
+    from: peer.clientId,
+    author: peer.displayName,
+    scope,
+    name: payload.name.slice(0, 180),
+    mime: mimeOrFallback(payload.mime),
+    size: payload.size,
+    chunks: payload.chunks,
+    createdAt: payload.createdAt,
+    parts: new Array<Uint8Array | undefined>(payload.chunks),
+    received: 0,
+    receivedBytes: 0,
+    startedAt: Date.now()
+  };
+  if (scope === "private") {
+    incoming.peerName = peer.displayName;
+  }
+  state.incomingFiles.set(incomingFileKey(peer.clientId, payload.fileId), incoming);
+}
+
+function handleFileChunk(
+  state: Runtime,
+  from: string,
+  payload: Extract<PlainPayload, { type: "file-chunk" }>
+): void {
+  pruneIncomingFiles(state);
+  const incoming = state.incomingFiles.get(incomingFileKey(from, payload.fileId));
+  if (!incoming || payload.total !== incoming.chunks || incoming.parts[payload.index]) {
+    return;
+  }
+  const bytes = base64urlDecode(payload.bytes);
+  if (bytes.length > FILE_CHUNK_BYTES || incoming.receivedBytes + bytes.length > incoming.size) {
+    state.incomingFiles.delete(incomingFileKey(from, payload.fileId));
+    return;
+  }
+  incoming.parts[payload.index] = bytes;
+  incoming.received += 1;
+  incoming.receivedBytes += bytes.length;
+}
+
+async function handleFileDone(
+  state: Runtime,
+  from: string,
+  payload: Extract<PlainPayload, { type: "file-done" }>
+): Promise<void> {
+  pruneIncomingFiles(state);
+  const key = incomingFileKey(from, payload.fileId);
+  const incoming = state.incomingFiles.get(key);
+  if (!incoming || incoming.received !== incoming.chunks) {
+    return;
+  }
+  const parts = incoming.parts.filter((part): part is Uint8Array => part !== undefined);
+  if (parts.length !== incoming.chunks) {
+    return;
+  }
+  const bytes = concatBytes(...parts);
+  const digest = await sha256(bytes);
+  if (bytes.length !== incoming.size || base64urlEncode(digest) !== payload.sha256) {
+    state.incomingFiles.delete(key);
+    addSystemMessage(`${incoming.author} 发送的文件完整性校验失败，已丢弃。`);
+    return;
+  }
+  const blob = new Blob([asBufferSource(bytes)], { type: incoming.mime });
+  const message: ChatMessage = {
+    id: `${from}:file:${payload.fileId}`,
+    own: false,
+    author: incoming.author,
+    kind: "file",
+    text: incoming.name,
+    fileName: incoming.name,
+    fileSize: incoming.size,
+    fileBlob: blob,
+    createdAt: incoming.createdAt,
+    scope: incoming.scope
+  };
+  if (incoming.peerName) {
+    message.peerName = incoming.peerName;
+  }
+  state.incomingFiles.delete(key);
+  pushMessage(state, message);
+  renderChat();
 }
 
 function addSystemMessage(text: string): void {
@@ -538,11 +1021,47 @@ function addSystemMessage(text: string): void {
     id: `system:${Date.now()}:${Math.random()}`,
     own: false,
     author: "系统",
+    kind: "text",
     text,
     createdAt: Date.now(),
-    unverified: false
+    scope: "room"
   });
   renderChat();
+}
+
+function currentDeliveryContext(state: Runtime): DeliveryContext {
+  const targetPeer = state.privatePeerId ? state.peers.get(state.privatePeerId) : null;
+  const context: DeliveryContext = {
+    targets: targetPeer ? [targetPeer] : [...state.peers.values()],
+    scope: targetPeer ? "private" : "room"
+  };
+  if (targetPeer) {
+    context.peerName = targetPeer.displayName;
+  }
+  return context;
+}
+
+async function sendPayloadWithContext(
+  state: Runtime,
+  delivery: DeliveryContext,
+  payload: PlainPayload,
+  kind: RelayKind
+): Promise<void> {
+  const outboundPayload: PlainPayload =
+    delivery.scope === "private" ? { type: "private", inner: payload } : payload;
+  const relayKind: RelayKind = delivery.scope === "private" ? "private" : kind;
+  for (const peer of delivery.targets) {
+    const envelope = await sealPayload({
+      roomId: state.room.roomId,
+      from: state.clientId,
+      to: peer.clientId,
+      kind: relayKind,
+      transcriptHash: peer.pair.transcriptHash,
+      ratchet: peer.sendRatchet,
+      payload: outboundPayload
+    });
+    state.ws.send(envelope);
+  }
 }
 
 async function sendTextMessage(text: string): Promise<void> {
@@ -551,28 +1070,182 @@ async function sendTextMessage(text: string): Promise<void> {
   if (!state || !message) {
     return;
   }
-  const payload: PlainPayload = { type: "text", text: message.slice(0, 8_000), createdAt: Date.now() };
-  for (const peer of state.peers.values()) {
-    const envelope = await sealPayload({
-      roomId: state.room.roomId,
-      from: state.clientId,
-      to: peer.clientId,
-      kind: "text",
-      transcriptHash: peer.pair.transcriptHash,
-      ratchet: peer.sendRatchet,
-      payload
-    });
-    state.ws.send(envelope);
-  }
-  pushMessage(state, {
+  const delivery = currentDeliveryContext(state);
+  const textPayload: PlainPayload = {
+    type: "text",
+    text: message.slice(0, 8_000),
+    createdAt: Date.now()
+  };
+  const ownMessage: ChatMessage = {
     id: `own:${Date.now()}`,
     own: true,
     author: state.displayName,
-    text: payload.text,
-    createdAt: payload.createdAt,
-    unverified: false
-  });
+    kind: "text",
+    text: textPayload.text,
+    createdAt: textPayload.createdAt,
+    scope: delivery.scope
+  };
+  if (delivery.peerName) {
+    ownMessage.peerName = delivery.peerName;
+  }
+  await sendPayloadWithContext(state, delivery, textPayload, "text");
+  pushMessage(state, ownMessage);
   renderChat();
+}
+
+async function sendImageBlob(blob: Blob, fallbackName: string): Promise<void> {
+  const state = runtime;
+  if (!state) {
+    return;
+  }
+  if (!isDisplayImage(blob)) {
+    addSystemMessage("仅支持 PNG、JPEG、GIF、WebP、AVIF、BMP 图片直接预览。");
+    return;
+  }
+  if (blob.size > MAX_INLINE_IMAGE_BYTES) {
+    addSystemMessage(`图片超过 ${formatBytes(MAX_INLINE_IMAGE_BYTES)}，请作为文件附件发送。`);
+    return;
+  }
+  const delivery = currentDeliveryContext(state);
+  const bytes = arrayBufferToBytes(await blob.arrayBuffer());
+  const createdAt = Date.now();
+  const imageUrl = imageUrlFromBytes(bytes, blob.type);
+  const ownMessage: ChatMessage = {
+    id: `own:image:${createdAt}:${Math.random()}`,
+    own: true,
+    author: state.displayName,
+    kind: "image",
+    text: fallbackName,
+    imageUrl,
+    imageMime: blob.type,
+    createdAt,
+    scope: delivery.scope
+  };
+  if (delivery.peerName) {
+    ownMessage.peerName = delivery.peerName;
+  }
+  try {
+    await sendPayloadWithContext(
+      state,
+      delivery,
+      {
+        type: "image",
+        mime: blob.type,
+        bytes: base64urlEncode(bytes),
+        createdAt
+      },
+      "image"
+    );
+    pushMessage(state, ownMessage);
+    renderChat();
+  } catch (error) {
+    revokeMessageResources(ownMessage);
+    addSystemMessage(error instanceof Error ? "图片发送失败。" : "图片发送失败。");
+  }
+}
+
+async function sendAttachmentFile(file: File): Promise<void> {
+  const state = runtime;
+  if (!state) {
+    return;
+  }
+  if (file.size > MAX_FILE_BYTES) {
+    addSystemMessage(`${file.name || "文件"} 超过 ${formatBytes(MAX_FILE_BYTES)}，已拒绝发送。`);
+    return;
+  }
+  const delivery = currentDeliveryContext(state);
+  const bytes = arrayBufferToBytes(await file.arrayBuffer());
+  const createdAt = Date.now();
+  const fileId = base64urlEncode(randomBytes(16));
+  const chunks = Math.max(1, Math.ceil(bytes.length / FILE_CHUNK_BYTES));
+  const name = fileNameOrFallback(file);
+  const mime = mimeOrFallback(file.type);
+  const digest = await sha256(bytes);
+  await sendPayloadWithContext(
+    state,
+    delivery,
+    {
+      type: "file-meta",
+      fileId,
+      name,
+      mime,
+      size: bytes.length,
+      chunks,
+      createdAt
+    },
+    "file-meta"
+  );
+  const chunkDelayMs =
+    delivery.targets.length > 0 ? Math.max(90, delivery.targets.length * 125) : 0;
+  for (let index = 0; index < chunks; index += 1) {
+    const start = index * FILE_CHUNK_BYTES;
+    const chunk = bytes.subarray(start, Math.min(start + FILE_CHUNK_BYTES, bytes.length));
+    await sendPayloadWithContext(
+      state,
+      delivery,
+      {
+        type: "file-chunk",
+        fileId,
+        index,
+        total: chunks,
+        bytes: base64urlEncode(chunk)
+      },
+      "file-chunk"
+    );
+    if (chunkDelayMs > 0 && index < chunks - 1) {
+      await delay(chunkDelayMs);
+    }
+  }
+  await sendPayloadWithContext(
+    state,
+    delivery,
+    {
+      type: "file-done",
+      fileId,
+      sha256: base64urlEncode(digest)
+    },
+    "file-done"
+  );
+  const ownMessage: ChatMessage = {
+    id: `own:file:${createdAt}:${Math.random()}`,
+    own: true,
+    author: state.displayName,
+    kind: "file",
+    text: name,
+    fileName: name,
+    fileSize: bytes.length,
+    fileBlob: file,
+    createdAt,
+    scope: delivery.scope
+  };
+  if (delivery.peerName) {
+    ownMessage.peerName = delivery.peerName;
+  }
+  pushMessage(state, ownMessage);
+  renderChat();
+}
+
+async function sendFiles(files: readonly File[]): Promise<void> {
+  const selected = files.slice(0, MAX_FILE_BATCH);
+  if (files.length > MAX_FILE_BATCH) {
+    addSystemMessage(`单次最多发送 ${MAX_FILE_BATCH} 个文件，已只处理前 ${MAX_FILE_BATCH} 个。`);
+  }
+  const totalSize = selected.reduce((sum, file) => sum + file.size, 0);
+  if (totalSize > MAX_FILE_BATCH_BYTES) {
+    addSystemMessage(`单批附件超过 ${formatBytes(MAX_FILE_BATCH_BYTES)}，已拒绝发送。`);
+    return;
+  }
+  for (const file of selected) {
+    try {
+      if (isDisplayImage(file) && file.size <= MAX_INLINE_IMAGE_BYTES) {
+        await sendImageBlob(file, fileNameOrFallback(file));
+      } else {
+        await sendAttachmentFile(file);
+      }
+    } catch {
+      addSystemMessage(`${file.name || "附件"} 发送失败。`);
+    }
+  }
 }
 
 function renderChat(): void {
@@ -587,26 +1260,55 @@ function renderChat(): void {
   roomHead.append(
     el("div", { className: "room-title", text: state.roomName }),
     el("div", { className: "safety-line", text: `房间安全码 ${state.safetyCode}` }),
-    el("div", { className: "safety-line", text: state.mode === "two-channel" ? "双通道邀请" : "单链接邀请" })
+    el("div", {
+      className: "safety-line",
+      text: state.mode === "two-channel" ? "双通道邀请" : "单链接邀请"
+    })
   );
   const memberList = el("div", { className: "member-list" });
-  const self = el("div", { className: "member" });
-  self.append(el("div", { className: "member-name" }, [state.displayName, el("span", { className: "badge ok", text: "自己" })]));
-  self.append(el("div", { className: "safety-line", text: formatSafetyCode(state.clientId.slice(0, 20).padEnd(20, "A")) }));
+  const self = el("button", {
+    className: state.privatePeerId ? "member member-button" : "member member-button active",
+    title: "切回房间",
+    ariaLabel: "切回房间"
+  });
+  self.addEventListener("click", () => {
+    state.privatePeerId = null;
+    renderChat();
+  });
+  self.append(
+    el("span", { className: "member-avatar", text: avatarText(state.roomName) }),
+    el("span", { className: "member-content" }, [
+      el("span", { className: "member-name" }, [state.roomName]),
+      el("span", { className: "member-subtitle", text: "房间" })
+    ]),
+    el("span", { className: "badge ok", text: "房间" })
+  );
   memberList.append(self);
   for (const peer of state.peers.values()) {
-    const item = el("div", { className: "member" });
+    const isPrivateTarget = state.privatePeerId === peer.clientId;
+    const item = el("button", {
+      className: isPrivateTarget ? "member member-button active" : "member member-button",
+      title: `私聊 ${peer.displayName}`,
+      ariaLabel: `私聊 ${peer.displayName}`
+    });
     setDataset(item, "clientId", peer.clientId);
-    const badge = el("span", { className: peer.verified ? "badge ok" : "badge", text: peer.verified ? "已核对" : "未核对" });
-    const verify = el("button", { className: "secondary", text: peer.verified ? "取消核对" : "标记核对" });
-    verify.addEventListener("click", () => {
-      peer.verified = !peer.verified;
+    item.addEventListener("click", () => {
+      state.privatePeerId = peer.clientId;
       renderChat();
     });
+    const badge = isPrivateTarget
+      ? el("span", { className: "badge ok", text: "私聊" })
+      : el("span", { className: "badge", text: "在线" });
     item.append(
-      el("div", { className: "member-name" }, [peer.displayName, badge]),
-      el("div", { className: "safety-line", text: peer.fingerprint }),
-      verify
+      el("span", { className: "member-avatar", text: avatarText(peer.displayName) }),
+      el("span", { className: "member-content" }, [
+        el("span", { className: "member-name", text: peer.displayName }),
+        el("span", {
+          className: "member-subtitle",
+          text: isPrivateTarget ? "当前私聊" : "点击私聊"
+        })
+      ]),
+      badge
     );
     memberList.append(item);
   }
@@ -614,67 +1316,366 @@ function renderChat(): void {
 
   const main = el("section", { className: "chat-main" });
   const topbar = el("header", { className: "topbar" });
-  const status = el("div", { className: "subtle", text: `${state.status} · ${state.peers.size + 1} 人在线` });
+  const privatePeer = state.privatePeerId ? state.peers.get(state.privatePeerId) : null;
+  const modeText = privatePeer ? `私聊：${privatePeer.displayName}` : "房间";
+  const status = el("div", { className: "chat-heading" }, [
+    el("div", {
+      className: "chat-heading-title",
+      text: privatePeer ? privatePeer.displayName : state.roomName
+    }),
+    el("div", {
+      className: "chat-heading-meta",
+      text: `${state.status} · ${state.peers.size + 1} 人在线 · ${modeText}`
+    })
+  ]);
+  const topbarButtons: Node[] = [];
+  if (state.inviteLink) {
+    const invite = el("button", { className: "secondary", text: "邀请" });
+    invite.addEventListener("click", () =>
+      showInviteDialog(state.inviteLink!, state.invitePassphrase, state.inviteMode)
+    );
+    topbarButtons.push(invite);
+  }
   const security = el("button", { className: "secondary", text: "安全详情" });
   security.addEventListener("click", showSecurityDetails);
-  topbar.append(status, security);
+  topbarButtons.push(security);
+  const leave = el("button", { className: "secondary", text: "退出房间" });
+  leave.addEventListener("click", () => {
+    destroyRuntime();
+    renderLogin();
+  });
+  topbarButtons.push(leave);
+  topbar.append(status, el("div", { className: "topbar-actions" }, topbarButtons));
+
+  const modeBanner = el("div", {
+    className: privatePeer ? "mode-banner private" : "mode-banner room",
+    text: privatePeer
+      ? `私聊模式：消息只发送给 ${privatePeer.displayName}`
+      : "房间模式：消息会发送给所有在线成员"
+  });
 
   const messages = el("div", { className: "messages" });
   for (const message of state.messages) {
-    const row = el("article", { className: message.own ? "message own" : "message" });
-    const metaText = `${message.author}${message.unverified ? " · 未核对" : ""} · ${new Date(message.createdAt).toLocaleTimeString()}`;
-    row.append(el("div", { className: "message-meta", text: metaText }), el("div", { text: message.text }));
+    const row = el("article", {
+      className: ["message", message.own ? "own" : "", message.scope].filter(Boolean).join(" ")
+    });
+    const scopeText =
+      message.scope === "private"
+        ? `私聊${message.peerName ? ` · ${message.peerName}` : ""}`
+        : "房间";
+    const metaText = `${message.author} · ${scopeText} · ${new Date(message.createdAt).toLocaleTimeString()}`;
+    row.append(el("div", { className: "message-meta", text: metaText }));
+    if (message.kind === "image" && message.imageUrl) {
+      const image = el("img", {
+        className: "message-image",
+        title: message.text ?? "图片"
+      });
+      image.src = message.imageUrl;
+      image.alt = message.text ?? "图片";
+      image.tabIndex = 0;
+      image.setAttribute("role", "button");
+      image.addEventListener("click", () => showImageViewer(message.imageUrl!, image.alt));
+      image.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          showImageViewer(message.imageUrl!, image.alt);
+        }
+      });
+      row.append(image);
+    } else if (message.kind === "file" && message.fileBlob) {
+      const fileBox = el("div", { className: "file-message" });
+      const fileInfo = el("div", { className: "file-info" }, [
+        el("div", { className: "file-name", text: message.fileName ?? "附件" }),
+        el("div", {
+          className: "file-size",
+          text: formatBytes(message.fileSize ?? message.fileBlob.size)
+        })
+      ]);
+      const download = el("button", { className: "file-download", text: "下载" });
+      download.type = "button";
+      download.addEventListener("click", () => {
+        safeDownload(message.fileBlob!, message.fileName ?? "attachment.bin");
+      });
+      fileBox.append(el("div", { className: "file-icon", text: "📎" }), fileInfo, download);
+      row.append(fileBox);
+    } else {
+      row.append(el("div", { className: "message-text", text: message.text ?? "" }));
+    }
     messages.append(row);
   }
 
   const composer = el("form", { className: "composer" });
-  const input = el("textarea", { placeholder: "输入消息，Enter 发送，Shift+Enter 换行" });
-  const send = el("button", { className: "primary", text: "发送" });
+  const composerPill = el("div", { className: "composer-pill" });
+  const emojiWrap = el("div", { className: "emoji-wrap" });
+  const emojiButton = el("button", {
+    className: "icon-button emoji-button",
+    text: "☺",
+    title: "表情",
+    ariaLabel: "表情"
+  });
+  emojiButton.type = "button";
+  const emojiPanel = el("div", { className: "emoji-panel" });
+  const emojiSearch = el("input", {
+    className: "emoji-search",
+    type: "search",
+    placeholder: "搜索表情"
+  });
+  const emojiCategories = el("div", { className: "emoji-categories" });
+  const emojiGrid = el("div", { className: "emoji-grid" });
+  let selectedEmojiGroup = EMOJI_CATEGORIES[0]!.group;
+  let emojiRecords: EmojiRecord[] | null = null;
+  const input = el("textarea", {
+    placeholder: "消息"
+  });
+  input.rows = 1;
+  const syncInputHeight = () => {
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 112)}px`;
+  };
+
+  const renderEmojiCategories = () => {
+    removeChildren(emojiCategories);
+    for (const category of EMOJI_CATEGORIES) {
+      const tab = el("button", {
+        className: category.group === selectedEmojiGroup ? "emoji-tab active" : "emoji-tab",
+        text: category.icon,
+        title: category.label,
+        ariaLabel: category.label
+      });
+      tab.type = "button";
+      tab.addEventListener("click", () => {
+        selectedEmojiGroup = category.group;
+        emojiSearch.value = "";
+        renderEmojiCategories();
+        renderEmojiGrid();
+      });
+      emojiCategories.append(tab);
+    }
+  };
+
+  const renderEmojiGrid = () => {
+    removeChildren(emojiGrid);
+    if (!emojiRecords) {
+      emojiGrid.append(el("div", { className: "emoji-empty", text: "正在加载…" }));
+      return;
+    }
+    const query = emojiSearch.value.trim();
+    const visible = emojiRecords
+      .filter((record) =>
+        query ? emojiMatches(record, query) : record.group === selectedEmojiGroup
+      )
+      .slice(0, EMOJI_GRID_LIMIT);
+    if (visible.length === 0) {
+      emojiGrid.append(el("div", { className: "emoji-empty", text: "没有匹配的表情" }));
+      return;
+    }
+    for (const record of visible) {
+      const item = el("button", {
+        className: "emoji-item",
+        text: record.emoji,
+        title: record.annotation,
+        ariaLabel: `插入 ${record.annotation}`
+      });
+      item.type = "button";
+      item.addEventListener("click", () => {
+        insertTextAtCursor(input, record.emoji);
+        emojiPanel.classList.remove("open");
+      });
+      emojiGrid.append(item);
+    }
+  };
+
+  const ensureEmojiData = () => {
+    renderEmojiGrid();
+    if (emojiRecords) {
+      return;
+    }
+    void loadEmojiData()
+      .then((records) => {
+        emojiRecords = records;
+        renderEmojiGrid();
+      })
+      .catch(() => {
+        removeChildren(emojiGrid);
+        emojiGrid.append(el("div", { className: "emoji-empty", text: "表情数据加载失败" }));
+      });
+  };
+
+  renderEmojiCategories();
+  emojiPanel.append(emojiSearch, emojiCategories, emojiGrid);
+  emojiSearch.addEventListener("input", renderEmojiGrid);
+  emojiSearch.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+    }
+  });
+  emojiButton.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    emojiPanel.classList.toggle("open");
+    if (emojiPanel.classList.contains("open")) {
+      ensureEmojiData();
+    }
+  });
+  emojiPanel.addEventListener("click", (event) => {
+    event.stopPropagation();
+  });
+  composer.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      emojiPanel.classList.remove("open");
+      input.focus();
+    }
+  });
+  emojiWrap.append(emojiButton, emojiPanel);
+  const attach = el("button", {
+    className: "icon-button attach-button",
+    text: "📎",
+    title: "附件",
+    ariaLabel: "附件"
+  });
+  attach.type = "button";
+  const fileInput = el("input", { className: "file-input", type: "file" });
+  fileInput.multiple = true;
+  attach.addEventListener("click", () => {
+    fileInput.click();
+  });
+  fileInput.addEventListener("change", () => {
+    const selected = [...(fileInput.files ?? [])];
+    fileInput.value = "";
+    if (selected.length > 0) {
+      void sendFiles(selected);
+    }
+  });
+  const send = el("button", {
+    className: "primary send-button",
+    text: "➤",
+    title: "发送",
+    ariaLabel: "发送"
+  });
+  send.type = "submit";
+  input.addEventListener("input", syncInputHeight);
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       send.click();
     }
   });
+  input.addEventListener("paste", (event) => {
+    const files = [...(event.clipboardData?.files ?? [])].filter((file) =>
+      file.type.startsWith("image/")
+    );
+    if (files.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    emojiPanel.classList.remove("open");
+    for (const file of files.slice(0, MAX_FILE_BATCH)) {
+      void sendImageBlob(file, fileNameOrFallback(file));
+    }
+  });
   composer.addEventListener("submit", (event) => {
     event.preventDefault();
     const value = input.value;
     input.value = "";
+    syncInputHeight();
+    emojiPanel.classList.remove("open");
     void sendTextMessage(value);
   });
-  composer.append(input, send);
-  main.append(topbar, messages, composer);
+  composerPill.append(emojiWrap, input, attach, fileInput);
+  composer.append(composerPill, send);
+  main.append(topbar, modeBanner, messages, composer);
   layout.append(sidebar, main);
   setApp(layout);
+  syncInputHeight();
   messages.scrollTop = messages.scrollHeight;
 }
 
-function showInviteDialog(link: string, passphrase: string, mode: "single-link" | "two-channel"): void {
+function showInviteDialog(
+  link: string,
+  passphrase: string,
+  mode: "single-link" | "two-channel"
+): void {
   const backdrop = el("div", { className: "modal-backdrop" });
   const dialog = el("section", { className: "dialog" });
   const linkInput = el("textarea", { value: link });
   const pass = el("input", { type: "text", value: passphrase });
+  const notice = el("div", { className: "copy-notice" });
+  const showCopyNotice = (message: string, isError = false) => {
+    notice.textContent = message;
+    notice.className = isError ? "copy-notice error" : "copy-notice ok";
+  };
   const close = el("button", { className: "primary", text: "关闭" });
   const copyLink = el("button", { className: "secondary", text: "复制链接" });
-  copyLink.addEventListener("click", () => void navigator.clipboard?.writeText(link));
+  copyLink.addEventListener("click", () => {
+    void navigator.clipboard
+      ?.writeText(link)
+      .then(() => showCopyNotice("链接已复制"))
+      .catch(() => showCopyNotice("复制失败，请手动复制", true));
+  });
   close.addEventListener("click", () => backdrop.remove());
   dialog.append(
     el("h2", { text: "邀请已生成" }),
     el("p", {
       className: "subtle",
-      text: mode === "two-channel" ? "请用两个独立渠道分别发送链接和口令。" : "单链接包含全部进入秘密。"
+      text:
+        mode === "two-channel" ? "请用两个独立渠道分别发送链接和口令。" : "单链接包含全部进入秘密。"
     }),
-    el("label", { className: "field" }, ["链接", linkInput])
+    el("label", { className: "field" }, ["链接", linkInput]),
+    notice
   );
   if (mode === "two-channel") {
     const copyPass = el("button", { className: "secondary", text: "复制口令" });
-    copyPass.addEventListener("click", () => void navigator.clipboard?.writeText(passphrase));
-    dialog.append(el("label", { className: "field" }, ["口令", pass]), el("div", { className: "actions" }, [copyLink, copyPass, close]));
+    copyPass.addEventListener("click", () => {
+      void navigator.clipboard
+        ?.writeText(passphrase)
+        .then(() => showCopyNotice("口令已复制"))
+        .catch(() => showCopyNotice("复制失败，请手动复制", true));
+    });
+    dialog.append(
+      el("label", { className: "field" }, ["口令", pass]),
+      el("div", { className: "actions" }, [copyLink, copyPass, close])
+    );
   } else {
-    dialog.append(el("div", { className: "warning", text: "链接被转发即获得进入能力。" }), el("div", { className: "actions" }, [copyLink, close]));
+    dialog.append(
+      el("div", { className: "warning", text: "链接被转发即获得进入能力。" }),
+      el("div", { className: "actions" }, [copyLink, close])
+    );
   }
   backdrop.append(dialog);
   document.body.append(backdrop);
+}
+
+function showImageViewer(src: string, alt: string): void {
+  const backdrop = el("div", { className: "image-viewer-backdrop" });
+  const viewer = el("div", { className: "image-viewer" });
+  const close = el("button", {
+    className: "image-viewer-close",
+    text: "×",
+    ariaLabel: "关闭图片查看"
+  });
+  const image = el("img", { className: "image-viewer-img", title: alt });
+  image.src = src;
+  image.alt = alt;
+  const closeViewer = () => {
+    document.removeEventListener("keydown", onKeydown);
+    backdrop.remove();
+  };
+  const onKeydown = (event: KeyboardEvent) => {
+    if (event.key === "Escape") {
+      closeViewer();
+    }
+  };
+  close.type = "button";
+  close.addEventListener("click", closeViewer);
+  backdrop.addEventListener("click", closeViewer);
+  viewer.addEventListener("click", (event) => {
+    event.stopPropagation();
+  });
+  document.addEventListener("keydown", onKeydown);
+  viewer.append(close, image);
+  backdrop.append(viewer);
+  document.body.append(backdrop);
+  close.focus();
 }
 
 function showSecurityDetails(): void {
@@ -696,10 +1697,20 @@ function showSecurityDetails(): void {
     })
   );
   if (state.mode === "single-link") {
-    dialog.append(el("div", { className: "warning", text: "当前房间使用单链接模式，邀请链接包含全部进入秘密。" }));
+    dialog.append(
+      el("div", {
+        className: "warning",
+        text: "当前房间使用单链接模式，邀请链接包含全部进入秘密。"
+      })
+    );
   }
   for (const peer of state.peers.values()) {
-    dialog.append(el("div", { className: "member" }, [el("div", { className: "member-name" }, [peer.displayName]), el("div", { className: "safety-line", text: peer.fingerprint })]));
+    dialog.append(
+      el("div", { className: "security-peer" }, [
+        el("div", { className: "member-name", text: peer.displayName }),
+        el("div", { className: "safety-line", text: peer.fingerprint })
+      ])
+    );
   }
   dialog.append(el("div", { className: "actions" }, [close]));
   backdrop.append(dialog);
