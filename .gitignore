@@ -1,0 +1,12 @@
+node_modules/
+.gitrepo/
+dist/
+server/dist/
+worker/dist/
+coverage/
+test-results/
+playwright-report/
+.wrangler/
+.env
+.env.*
+*.log

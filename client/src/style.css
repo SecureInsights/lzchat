@@ -1,0 +1,388 @@
+:root {
+  color-scheme: light;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f5f7fb;
+  color: #162033;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  cursor: pointer;
+}
+
+button:disabled,
+input:disabled,
+textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.login-screen {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: minmax(280px, 460px) minmax(280px, 1fr);
+  background:
+    linear-gradient(90deg, rgba(245, 247, 251, 0.96), rgba(245, 247, 251, 0.74)),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1200' height='900' viewBox='0 0 1200 900'%3E%3Crect width='1200' height='900' fill='%23e7edf5'/%3E%3Cpath d='M0 628c127-67 259-86 396-57s251 21 343-24 245-61 461-49v402H0z' fill='%23d4e3df'/%3E%3Cpath d='M734 0h466v900H934c-24-154-25-299-3-436 23-144-42-299-197-464z' fill='%23c7d8ee'/%3E%3Ccircle cx='858' cy='264' r='116' fill='%23f1d7be'/%3E%3C/svg%3E");
+  background-size: cover;
+}
+
+.login-panel {
+  padding: 32px;
+  align-self: center;
+  margin-left: clamp(12px, 5vw, 72px);
+  max-width: 460px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 22px;
+  font-weight: 700;
+  font-size: 18px;
+}
+
+.brand-mark {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  background: #174b4f;
+  color: #fff;
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+}
+
+.login-panel h1 {
+  margin: 0 0 12px;
+  font-size: 38px;
+  line-height: 1.05;
+  letter-spacing: 0;
+}
+
+.subtle {
+  color: #526173;
+  line-height: 1.5;
+}
+
+.form-grid {
+  display: grid;
+  gap: 14px;
+  margin-top: 28px;
+}
+
+.field {
+  display: grid;
+  gap: 7px;
+  font-size: 14px;
+  color: #344255;
+}
+
+.field input,
+.field textarea,
+.field select {
+  width: 100%;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 12px 13px;
+  background: #fff;
+  color: #111827;
+}
+
+.field textarea {
+  min-height: 84px;
+  resize: vertical;
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+
+.segmented button {
+  padding: 11px 8px;
+  background: #fff;
+  color: #334155;
+}
+
+.segmented button.active {
+  background: #174b4f;
+  color: #fff;
+}
+
+.primary,
+.secondary,
+.icon-button {
+  min-height: 42px;
+  border-radius: 8px;
+  padding: 0 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.primary {
+  background: #174b4f;
+  color: white;
+}
+
+.secondary,
+.icon-button {
+  background: #e8edf3;
+  color: #1f2937;
+}
+
+.invite-output {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  padding: 14px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.warning {
+  border-left: 4px solid #b45309;
+  background: #fff7ed;
+  color: #7c2d12;
+  padding: 10px 12px;
+  border-radius: 6px;
+}
+
+.chat-layout {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  background: #eef2f7;
+}
+
+.sidebar {
+  border-right: 1px solid #d5dde7;
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.room-head {
+  padding: 18px;
+  border-bottom: 1px solid #d5dde7;
+  display: grid;
+  gap: 8px;
+}
+
+.room-title {
+  font-size: 18px;
+  font-weight: 700;
+  word-break: break-word;
+}
+
+.safety-line {
+  font-size: 12px;
+  color: #475569;
+  word-break: break-all;
+}
+
+.member-list {
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+  overflow: auto;
+}
+
+.member {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border: 1px solid #d9e1eb;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.member-name {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 650;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+  border-radius: 999px;
+  padding: 0 8px;
+  background: #e2e8f0;
+  color: #334155;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.badge.ok {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.chat-main {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 100vh;
+}
+
+.topbar {
+  min-height: 62px;
+  padding: 12px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #ffffff;
+  border-bottom: 1px solid #d5dde7;
+}
+
+.messages {
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+}
+
+.message {
+  max-width: min(680px, 92%);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fff;
+  border: 1px solid #d5dde7;
+  overflow-wrap: anywhere;
+}
+
+.message.own {
+  align-self: flex-end;
+  background: #dcefed;
+  border-color: #b9d7d2;
+}
+
+.message-meta {
+  color: #64748b;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.composer {
+  padding: 12px;
+  background: #fff;
+  border-top: 1px solid #d5dde7;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.composer textarea {
+  min-height: 46px;
+  max-height: 140px;
+  resize: vertical;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  padding: 11px 12px;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.36);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+
+.dialog {
+  width: min(560px, 100%);
+  border-radius: 8px;
+  background: #fff;
+  padding: 18px;
+  display: grid;
+  gap: 12px;
+  box-shadow: 0 22px 70px rgba(15, 23, 42, 0.26);
+}
+
+.dialog h2 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+@media (max-width: 760px) {
+  .login-screen {
+    grid-template-columns: 1fr;
+  }
+
+  .login-panel {
+    margin: 0;
+    padding: 24px 16px;
+  }
+
+  .login-panel h1 {
+    font-size: 30px;
+  }
+
+  .chat-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    min-height: auto;
+    border-right: 0;
+    border-bottom: 1px solid #d5dde7;
+  }
+
+  .member-list {
+    display: flex;
+    overflow-x: auto;
+  }
+
+  .member {
+    min-width: 220px;
+  }
+
+  .composer {
+    grid-template-columns: 1fr;
+  }
+}

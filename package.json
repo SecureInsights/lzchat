@@ -1,0 +1,41 @@
+{
+  "name": "secure-chat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "dev:client": "vite --config vite.config.ts --host 127.0.0.1",
+    "dev:local": "npm run build:client && npm run build:server && node server/dist/server.js",
+    "build": "npm run build:client && npm run build:worker && npm run build:server",
+    "build:client": "vite build --config vite.config.ts",
+    "build:worker": "tsc -p worker/tsconfig.json",
+    "build:server": "tsc -p server/tsconfig.json",
+    "deploy": "npm run build && wrangler deploy",
+    "publish": "npm run deploy",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "test:e2e:system": "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=${PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH:-/usr/bin/chromium} playwright test",
+    "pw:install:mirror": "PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright npx playwright install chromium",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "smoke:local": "node scripts/smoke-local.mjs",
+    "smoke:worker": "node scripts/smoke-worker.mjs",
+    "audit": "npm audit --audit-level=moderate"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.8.0",
+    "@playwright/test": "^1.45.3",
+    "@types/node": "^20.14.15",
+    "eslint": "^9.8.0",
+    "prettier": "^3.3.3",
+    "typescript": "^5.5.4",
+    "typescript-eslint": "^8.0.0",
+    "vite": "^8.1.3",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.0.0"
+  }
+}
