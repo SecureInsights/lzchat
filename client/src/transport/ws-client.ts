@@ -1,5 +1,5 @@
 import type { JoinMessage, ServerMessage } from "../protocol/types";
-import { parseJsonObject } from "../protocol/validator";
+import { parseJsonObject, validateServerMessage } from "../protocol/validator";
 
 export type WsClientHandlers = {
   open: () => void;
@@ -34,11 +34,15 @@ export class WsClient {
       if (typeof event.data !== "string") {
         return;
       }
-      const parsed = parseJsonObject(event.data);
-      if (!parsed || parsed.v !== 3) {
+      const parsed = validateServerMessage(parseJsonObject(event.data), this.joinMessage.roomId);
+      if (!parsed) {
         return;
       }
-      this.handlers.message(parsed as ServerMessage);
+      try {
+        this.handlers.message(parsed as ServerMessage);
+      } catch {
+        this.handlers.status("消息处理失败");
+      }
     });
     socket.addEventListener("close", () => {
       if (this.#socket === socket) {

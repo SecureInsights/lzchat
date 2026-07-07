@@ -3,6 +3,7 @@ import { base64urlDecode, base64urlEncode } from "../crypto/base64url";
 import { fromUtf8, utf8, zeroize } from "../crypto/bytes";
 import { stableJson } from "../crypto/stable-json";
 import { deriveNonce, type SendRatchet, type ReceiveRatchet } from "../crypto/ratchet";
+import { validatePlainPayload } from "./validator";
 import type { PlainPayload, RelayAad, RelayEnvelope, RelayKind } from "./types";
 
 export type SealInput = {
@@ -74,7 +75,7 @@ export async function openPayload(
     }
     const plaintext = await aesGcmDecrypt(key, nonce, aad, base64urlDecode(envelope.ct));
     ratchet.markAccepted(envelope.seq);
-    return JSON.parse(fromUtf8(plaintext)) as PlainPayload;
+    return validatePlainPayload(JSON.parse(fromUtf8(plaintext)));
   } catch {
     ratchet.restoreSkipped(envelope.seq, key);
     return null;

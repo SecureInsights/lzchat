@@ -6,6 +6,7 @@ import {
   MAX_RELAY_SIZE,
   MAX_ROOM_MEMBERS,
   RATE_WINDOW_MS,
+  JOIN_TIMEOUT_MS,
   isValidRoomId,
   parseJsonObject,
   validateJoinMessage,
@@ -43,6 +44,7 @@ declare const WebSocketPair: {
 export class ChatRoom {
   #clients = new Map<string, ClientState>();
   #socketToClient = new Map<WebSocket, ClientState>();
+  #pendingSockets = new Set<WebSocket>();
   #epoch = 0;
   #roomId: string | null = null;
 
@@ -57,6 +59,13 @@ export class ChatRoom {
     const client = pair[0];
     const server = pair[1] as WebSocket & { accept: () => void };
     server.accept();
+    this.#pendingSockets.add(server);
+    setTimeout(() => {
+      if (this.#pendingSockets.has(server)) {
+        server.close(1008, "join_timeout");
+        this.#pendingSockets.delete(server);
+      }
+    }, JOIN_TIMEOUT_MS);
     server.addEventListener("message", (event: MessageEvent) => {
       if (typeof event.data === "string" && event.data.length <= MAX_RELAY_SIZE) {
         this.onMessage(server, event.data);
@@ -101,8 +110,14 @@ export class ChatRoom {
 
   private join(socket: WebSocket, join: JoinMessage): void {
     const existing = this.#clients.get(join.clientId);
+    if (existing) {
+      socket.close(1008, "duplicate_client_id");
+      this.#pendingSockets.delete(socket);
+      return;
+    }
     if (!existing && this.#clients.size >= MAX_ROOM_MEMBERS) {
       socket.close(1013, "room_full");
+      this.#pendingSockets.delete(socket);
       return;
     }
     const state: ClientState = {
@@ -120,9 +135,7 @@ export class ChatRoom {
     }
     this.#clients.set(join.clientId, state);
     this.#socketToClient.set(socket, state);
-    if (existing && existing.socket !== socket) {
-      existing.socket.close(4000, "replaced");
-    }
+    this.#pendingSockets.delete(socket);
     this.broadcastMembers();
   }
 
@@ -146,6 +159,7 @@ export class ChatRoom {
   }
 
   private removeSocket(socket: WebSocket): void {
+    this.#pendingSockets.delete(socket);
     const state = this.#socketToClient.get(socket);
     this.#socketToClient.delete(socket);
     if (!state) {

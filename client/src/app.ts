@@ -5,6 +5,7 @@ import { formatSafetyCode, peerFingerprint, roomSafetyCode, rosterDigest } from 
 import { derivePairSession, generateSessionKeys, type PairSession, type SessionKeys } from "./crypto/handshake";
 import { randomBytes } from "./crypto/random";
 import { ReceiveRatchet, SendRatchet } from "./crypto/ratchet";
+import { zeroize } from "./crypto/bytes";
 import {
   clearLocationFragment,
   createInviteSecret,
@@ -36,6 +37,9 @@ type PeerRuntime = {
   fingerprint: string;
   verified: boolean;
   profileSent: boolean;
+  messageWindow: number[];
+  decryptFailures: number;
+  lastFailureNoticeAt: number;
 };
 
 type ChatMessage = {
@@ -75,6 +79,10 @@ if (pendingInviteToken) {
 }
 
 let runtime: Runtime | null = null;
+const MAX_RENDERED_MESSAGES = 500;
+const PEER_MESSAGE_WINDOW_MS = 10_000;
+const PEER_MAX_MESSAGES_PER_WINDOW = 120;
+const FAILURE_NOTICE_INTERVAL_MS = 5_000;
 
 function isTrustedContext(): boolean {
   return (
@@ -87,6 +95,10 @@ function isTrustedContext(): boolean {
 
 function makePassphrase(): string {
   return base64urlEncode(randomBytes(18)).match(/.{1,6}/gu)?.join("-") ?? base64urlEncode(randomBytes(18));
+}
+
+function randomLabel(prefix: string): string {
+  return `${prefix}-${base64urlEncode(randomBytes(5)).slice(0, 7)}`;
 }
 
 function parseInviteInput(value: string): string {
@@ -119,6 +131,47 @@ function setApp(node: Node): void {
   appRoot.append(node);
 }
 
+function pushMessage(state: Runtime, message: ChatMessage): void {
+  state.messages.push(message);
+  if (state.messages.length > MAX_RENDERED_MESSAGES) {
+    state.messages.splice(0, state.messages.length - MAX_RENDERED_MESSAGES);
+  }
+}
+
+function destroyPeer(peer: PeerRuntime): void {
+  peer.sendRatchet.destroy();
+  peer.recvRatchet.destroy();
+  zeroize(peer.pair.rootKey);
+  zeroize(peer.pair.sendCK);
+  zeroize(peer.pair.recvCK);
+}
+
+function destroyRuntime(): void {
+  const state = runtime;
+  if (!state) {
+    return;
+  }
+  state.ws.close();
+  for (const peer of state.peers.values()) {
+    destroyPeer(peer);
+  }
+  zeroize(state.room.roomSeed);
+  zeroize(state.room.roomSecret);
+  zeroize(state.room.roomPsk);
+  zeroize(state.room.rosterKey);
+  zeroize(state.room.fileKey);
+  state.peers.clear();
+  state.messages.splice(0);
+  runtime = null;
+}
+
+function acceptPeerRate(peer: PeerRuntime): boolean {
+  const now = Date.now();
+  peer.messageWindow = peer.messageWindow.filter((seen) => now - seen < PEER_MESSAGE_WINDOW_MS);
+  peer.messageWindow.push(now);
+  return peer.messageWindow.length <= PEER_MAX_MESSAGES_PER_WINDOW;
+}
+
 function setNotice(container: HTMLElement, message: string, isError = false): void {
   removeChildren(container);
   if (message) {
@@ -131,8 +184,7 @@ function inviteUrl(inviteToken: string): string {
 }
 
 function renderLogin(): void {
-  runtime?.ws.close();
-  runtime = null;
+  destroyRuntime();
 
   let mode: "single-link" | "two-channel" = "two-channel";
   let decodedInvite: ParsedInvite | null = null;
@@ -148,22 +200,26 @@ function renderLogin(): void {
   const panel = el("div", { className: "login-panel" });
   const brand = el("div", { className: "brand" }, [el("span", { className: "brand-mark", text: "S" }), APP_NAME]);
   const title = el("h1", { text: decodedInvite ? "加入临时加密房间" : "创建临时加密房间" });
-  const desc = el("p", {
-    className: "subtle",
-    text: "服务端只看见 roomId、连接状态和密文 envelope。默认使用双通道邀请，链接和口令分开发送。"
-  });
+  const desc = decodedInvite ? el("p", { className: "subtle", text: "输入口令后即可进入。" }) : null;
   const form = el("div", { className: "form-grid" });
   const notice = el("div");
 
   const nameInput = el("input", {
     type: "text",
     placeholder: "例如 Alice",
-    value: decodedInvite ? "访客" : "Alice"
+    value: randomLabel(decodedInvite ? "访客" : "用户")
+  });
+  const randomName = el("button", { className: "icon-button", text: "⚄", title: "随机昵称", ariaLabel: "随机昵称" });
+  randomName.addEventListener("click", () => {
+    nameInput.value = randomLabel(decodedInvite ? "访客" : "用户");
   });
   const roomInput = el("input", {
     type: "text",
-    placeholder: "只在本机显示",
-    value: decodedInvite ? "临时房间" : "高保密房间"
+    placeholder: "只在本机显示"
+  });
+  const randomRoom = el("button", { className: "icon-button", text: "⚄", title: "随机房间名", ariaLabel: "随机房间名" });
+  randomRoom.addEventListener("click", () => {
+    roomInput.value = randomLabel("房间");
   });
   const inviteInput = el("textarea", {
     placeholder: "粘贴邀请链接或 invite token"
@@ -177,15 +233,15 @@ function renderLogin(): void {
   });
 
   const modeButtons = el("div", { className: "segmented" });
-  const highButton = el("button", { text: "高保密" });
-  const normalButton = el("button", { text: "普通" });
+  const highButton = el("button", { text: "私密" });
+  const normalButton = el("button", { text: "公开" });
   highButton.classList.add("active");
   highButton.addEventListener("click", () => {
     mode = "two-channel";
     highButton.classList.add("active");
     normalButton.classList.remove("active");
     passInput.disabled = false;
-    passInput.placeholder = "留空自动生成独立口令";
+    passInput.placeholder = "留空自动生成口令";
   });
   normalButton.addEventListener("click", () => {
     mode = "single-link";
@@ -197,8 +253,8 @@ function renderLogin(): void {
   modeButtons.append(highButton, normalButton);
 
   form.append(
-    el("label", { className: "field" }, ["昵称", nameInput]),
-    el("label", { className: "field" }, ["房间显示名", roomInput])
+    el("label", { className: "field" }, ["昵称", el("div", { className: "input-row" }, [nameInput, randomName])]),
+    el("label", { className: "field" }, ["房间显示名", el("div", { className: "input-row" }, [roomInput, randomRoom])])
   );
 
   if (decodedInvite) {
@@ -207,7 +263,7 @@ function renderLogin(): void {
       form.append(el("label", { className: "field" }, ["独立口令", passInput]));
     }
   } else {
-    form.append(el("label", { className: "field" }, ["邀请模式", modeButtons]), el("label", { className: "field" }, ["独立口令", passInput]));
+    form.append(el("label", { className: "field" }, ["隐私性", modeButtons]), el("label", { className: "field" }, ["口令", passInput]));
   }
 
   const action = el("button", { className: "primary", text: decodedInvite ? "加入房间" : "创建房间" });
@@ -252,7 +308,11 @@ function renderLogin(): void {
     form.append(el("div", { className: "warning", text: "该邀请为单链接模式，链接包含全部进入秘密。" }));
   }
 
-  panel.append(brand, title, desc, form);
+  panel.append(brand, title);
+  if (desc) {
+    panel.append(desc);
+  }
+  panel.append(form);
   screen.append(panel);
   setApp(screen);
 }
@@ -342,8 +402,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
   const liveIds = new Set(message.members.map((member) => member.clientId));
   for (const [clientId, peer] of state.peers) {
     if (!liveIds.has(clientId)) {
-      peer.sendRatchet.destroy();
-      peer.recvRatchet.destroy();
+      destroyPeer(peer);
       state.peers.delete(clientId);
     }
   }
@@ -355,8 +414,12 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     if (existing && existing.sessionPub === member.sessionPub) {
       continue;
     }
-    existing?.sendRatchet.destroy();
-    existing?.recvRatchet.destroy();
+    if (existing && existing.sessionPub !== member.sessionPub) {
+      addSystemMessage(`${existing.displayName} 的会话密钥已变化，需要重新核对安全码。`);
+    }
+    if (existing) {
+      destroyPeer(existing);
+    }
     const pair = await derivePairSession({
       roomId: state.room.roomId,
       roomPsk: state.room.roomPsk,
@@ -367,17 +430,24 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       peerSessionPub: member.sessionPub,
       capabilities: state.capabilities
     });
+    const sendRatchet = new SendRatchet(pair.sendCK);
+    const recvRatchet = new ReceiveRatchet(pair.recvCK);
+    zeroize(pair.sendCK);
+    zeroize(pair.recvCK);
     state.peers.set(member.clientId, {
       clientId: member.clientId,
       sessionPub: member.sessionPub,
       displayName: existing?.displayName ?? `临时成员 ${member.clientId.slice(0, 4)}`,
       capabilities: member.capabilities,
       pair,
-      sendRatchet: new SendRatchet(pair.sendCK),
-      recvRatchet: new ReceiveRatchet(pair.recvCK),
+      sendRatchet,
+      recvRatchet,
       fingerprint: await peerFingerprint(state.room.roomId, member.sessionPub),
-      verified: existing?.verified ?? false,
-      profileSent: false
+      verified: existing && existing.sessionPub === member.sessionPub ? existing.verified : false,
+      profileSent: false,
+      messageWindow: existing?.messageWindow ?? [],
+      decryptFailures: 0,
+      lastFailureNoticeAt: 0
     });
   }
   const digest = await rosterDigest(message.members);
@@ -428,9 +498,17 @@ async function handleRelay(envelope: RelayEnvelope): Promise<void> {
   if (!peer) {
     return;
   }
+  if (!acceptPeerRate(peer)) {
+    return;
+  }
   const payload = await openPayload(envelope, peer.pair.transcriptHash, peer.recvRatchet);
   if (!payload) {
-    addSystemMessage("有一条密文未通过验证，已丢弃。");
+    peer.decryptFailures += 1;
+    const now = Date.now();
+    if (now - peer.lastFailureNoticeAt > FAILURE_NOTICE_INTERVAL_MS) {
+      addSystemMessage(`${peer.displayName} 有密文未通过验证，已丢弃。`);
+      peer.lastFailureNoticeAt = now;
+    }
     return;
   }
   if (payload.type === "profile") {
@@ -439,7 +517,7 @@ async function handleRelay(envelope: RelayEnvelope): Promise<void> {
     return;
   }
   if (payload.type === "text") {
-    state.messages.push({
+    pushMessage(state, {
       id: `${envelope.from}:${envelope.seq}`,
       own: false,
       author: peer.displayName,
@@ -456,7 +534,7 @@ function addSystemMessage(text: string): void {
   if (!state) {
     return;
   }
-  state.messages.push({
+  pushMessage(state, {
     id: `system:${Date.now()}:${Math.random()}`,
     own: false,
     author: "系统",
@@ -486,7 +564,7 @@ async function sendTextMessage(text: string): Promise<void> {
     });
     state.ws.send(envelope);
   }
-  state.messages.push({
+  pushMessage(state, {
     id: `own:${Date.now()}`,
     own: true,
     author: state.displayName,
@@ -629,3 +707,5 @@ function showSecurityDetails(): void {
 }
 
 renderLogin();
+
+window.addEventListener("pagehide", destroyRuntime);

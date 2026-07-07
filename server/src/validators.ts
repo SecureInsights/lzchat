@@ -36,6 +36,7 @@ export const MAX_MESSAGES_PER_WINDOW = 100;
 export const RATE_WINDOW_MS = 10_000;
 export const MAX_BAD_MESSAGES = 8;
 export const CLIENT_TIMEOUT_MS = 90_000;
+export const JOIN_TIMEOUT_MS = 10_000;
 
 export const ROOM_ID_RE = /^[A-Za-z0-9_-]{16,64}$/u;
 export const CLIENT_ID_RE = /^[A-Za-z0-9_-]{16,128}$/u;

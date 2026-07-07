@@ -40,26 +40,28 @@ textarea:disabled {
 
 .login-screen {
   min-height: 100vh;
-  display: grid;
-  grid-template-columns: minmax(280px, 460px) minmax(280px, 1fr);
-  background:
-    linear-gradient(90deg, rgba(245, 247, 251, 0.96), rgba(245, 247, 251, 0.74)),
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1200' height='900' viewBox='0 0 1200 900'%3E%3Crect width='1200' height='900' fill='%23e7edf5'/%3E%3Cpath d='M0 628c127-67 259-86 396-57s251 21 343-24 245-61 461-49v402H0z' fill='%23d4e3df'/%3E%3Cpath d='M734 0h466v900H934c-24-154-25-299-3-436 23-144-42-299-197-464z' fill='%23c7d8ee'/%3E%3Ccircle cx='858' cy='264' r='116' fill='%23f1d7be'/%3E%3C/svg%3E");
-  background-size: cover;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px 16px;
+  background: #f5f7fb;
 }
 
 .login-panel {
-  padding: 32px;
-  align-self: center;
-  margin-left: clamp(12px, 5vw, 72px);
-  max-width: 460px;
+  width: min(100%, 430px);
+  padding: 26px;
+  border: 1px solid #d8e0ea;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 18px 55px rgba(26, 39, 64, 0.08);
 }
 
 .brand {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 22px;
+  justify-content: center;
+  margin-bottom: 18px;
   font-weight: 700;
   font-size: 18px;
 }
@@ -76,9 +78,10 @@ textarea:disabled {
 }
 
 .login-panel h1 {
-  margin: 0 0 12px;
-  font-size: 38px;
-  line-height: 1.05;
+  margin: 0 0 10px;
+  text-align: center;
+  font-size: 28px;
+  line-height: 1.15;
   letter-spacing: 0;
 }
 
@@ -87,10 +90,15 @@ textarea:disabled {
   line-height: 1.5;
 }
 
+.login-panel > .subtle {
+  margin: 0;
+  text-align: center;
+}
+
 .form-grid {
   display: grid;
   gap: 14px;
-  margin-top: 28px;
+  margin-top: 22px;
 }
 
 .field {
@@ -109,6 +117,20 @@ textarea:disabled {
   padding: 12px 13px;
   background: #fff;
   color: #111827;
+}
+
+.input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.input-row .icon-button {
+  width: 42px;
+  min-width: 42px;
+  padding: 0 12px;
+  font-size: 18px;
 }
 
 .field textarea {
@@ -351,16 +373,16 @@ textarea:disabled {
 
 @media (max-width: 760px) {
   .login-screen {
-    grid-template-columns: 1fr;
+    align-items: stretch;
   }
 
   .login-panel {
-    margin: 0;
-    padding: 24px 16px;
+    align-self: center;
+    padding: 22px 16px;
   }
 
   .login-panel h1 {
-    font-size: 30px;
+    font-size: 25px;
   }
 
   .chat-layout {
@@ -383,6 +405,10 @@ textarea:disabled {
   }
 
   .composer {
+    grid-template-columns: 1fr;
+  }
+
+  .input-row {
     grid-template-columns: 1fr;
   }
 }

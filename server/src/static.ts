@@ -17,14 +17,23 @@ const MIME_TYPES: Record<string, string> = {
   ".ico": "image/x-icon"
 };
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  applySecurityHeaders(res);
+function isHttpsRequest(req: IncomingMessage): boolean {
+  return req.headers["x-forwarded-proto"] === "https";
+}
+
+export function sendJson(req: IncomingMessage, res: ServerResponse, status: number, body: unknown): void {
+  applySecurityHeaders(res, { upgradeInsecureRequests: isHttpsRequest(req) });
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
 }
 
 function safePath(distDir: string, pathname: string): string | null {
-  const decoded = decodeURIComponent(pathname);
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
   const normalized = path.normalize(decoded).replace(/^(\.\.(\/|\\|$))+/u, "");
   const relative = normalized === "/" ? "index.html" : normalized.replace(/^[/\\]+/u, "");
   const resolved = path.resolve(distDir, relative);
@@ -35,22 +44,22 @@ function safePath(distDir: string, pathname: string): string | null {
 export async function serveHttp(req: IncomingMessage, res: ServerResponse, distDir: string): Promise<void> {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   if (url.pathname === "/api/health") {
-    sendJson(res, 200, { ok: true, protocol: 3 });
+    sendJson(req, res, 200, { ok: true, protocol: 3 });
     return;
   }
   if (url.pathname.startsWith("/api/")) {
-    sendJson(res, 404, { error: "not_found" });
+    sendJson(req, res, 404, { error: "not_found" });
     return;
   }
   if (url.pathname === "/ws") {
-    sendJson(res, 426, { error: "upgrade_required" });
+    sendJson(req, res, 426, { error: "upgrade_required" });
     return;
   }
   const direct = safePath(distDir, url.pathname);
   const indexPath = path.resolve(distDir, "index.html");
   let filePath = direct;
   if (!filePath) {
-    sendJson(res, 400, { error: "bad_path" });
+    sendJson(req, res, 400, { error: "bad_path" });
     return;
   }
   try {
@@ -63,11 +72,11 @@ export async function serveHttp(req: IncomingMessage, res: ServerResponse, distD
     filePath = indexPath;
   }
   try {
-    applySecurityHeaders(res);
+    applySecurityHeaders(res, { upgradeInsecureRequests: isHttpsRequest(req) });
     const ext = path.extname(filePath);
     res.writeHead(200, { "content-type": MIME_TYPES[ext] ?? "application/octet-stream" });
     createReadStream(filePath).pipe(res);
   } catch {
-    sendJson(res, 404, { error: "not_found" });
+    sendJson(req, res, 404, { error: "not_found" });
   }
 }

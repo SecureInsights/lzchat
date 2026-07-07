@@ -20,8 +20,15 @@ export const SECURITY_HEADERS: Record<string, string> = {
   ].join("; ")
 };
 
-export function applySecurityHeaders(res: ServerResponse): void {
+export function applySecurityHeaders(res: ServerResponse, options: { upgradeInsecureRequests?: boolean } = {}): void {
   for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
-    res.setHeader(name, value);
+    if (name === "Content-Security-Policy" && options.upgradeInsecureRequests) {
+      res.setHeader(name, `${value}; upgrade-insecure-requests`);
+    } else {
+      res.setHeader(name, value);
+    }
+  }
+  if (options.upgradeInsecureRequests) {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   }
 }

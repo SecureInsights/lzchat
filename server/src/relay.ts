@@ -8,6 +8,7 @@ import {
   MAX_RELAY_SIZE,
   MAX_ROOM_MEMBERS,
   RATE_WINDOW_MS,
+  JOIN_TIMEOUT_MS,
   isValidRoomId,
   parseJsonObject,
   validateJoinMessage,
@@ -62,6 +63,10 @@ export class WebSocketPeer {
       return;
     }
     this.#buffer = Buffer.concat([this.#buffer, chunk]);
+    if (this.#buffer.length > MAX_RELAY_SIZE + 14) {
+      this.close(1009, "too_big");
+      return;
+    }
     while (this.#buffer.length >= 2) {
       const first = this.#buffer[0]!;
       const second = this.#buffer[1]!;
@@ -159,11 +164,21 @@ export class WebSocketPeer {
 class Room {
   readonly clients = new Map<string, ClientState>();
   #epoch = 0;
+  #sockets = 0;
 
-  constructor(readonly roomId: string) {}
+  constructor(
+    readonly roomId: string,
+    private readonly onEmpty: (roomId: string) => void
+  ) {}
 
   attach(socket: WebSocketPeer): void {
     let state: ClientState | null = null;
+    this.#sockets += 1;
+    const joinDeadline = setTimeout(() => {
+      if (!state) {
+        socket.close(1008, "join_timeout");
+      }
+    }, JOIN_TIMEOUT_MS);
     const timeout = setInterval(() => {
       if (!state) {
         return;
@@ -185,20 +200,30 @@ class Room {
           return;
         }
         state = this.join(socket, join);
+        if (state) {
+          clearTimeout(joinDeadline);
+        }
         return;
       }
       this.onClientMessage(state, parsed);
     };
     socket.onClose = () => {
+      clearTimeout(joinDeadline);
       clearInterval(timeout);
       if (state) {
         this.remove(state.clientId, socket);
       }
+      this.#sockets = Math.max(0, this.#sockets - 1);
+      this.checkEmpty();
     };
   }
 
   private join(socket: WebSocketPeer, join: JoinMessage): ClientState | null {
     const existing = this.clients.get(join.clientId);
+    if (existing) {
+      socket.close(1008, "duplicate_client_id");
+      return null;
+    }
     if (!existing && this.clients.size >= MAX_ROOM_MEMBERS) {
       socket.close(1013, "room_full");
       return null;
@@ -217,9 +242,6 @@ class Room {
       state.identityPub = join.identityPub;
     }
     this.clients.set(join.clientId, state);
-    if (existing && existing.socket !== socket) {
-      existing.socket.close(4000, "replaced");
-    }
     this.broadcastMembers();
     return state;
   }
@@ -257,6 +279,13 @@ class Room {
     if (current && current.socket === socket) {
       this.clients.delete(clientId);
       this.broadcastMembers();
+      this.checkEmpty();
+    }
+  }
+
+  private checkEmpty(): void {
+    if (this.clients.size === 0 && this.#sockets === 0) {
+      this.onEmpty(this.roomId);
     }
   }
 
@@ -302,7 +331,14 @@ export class RelayHub {
       return;
     }
     const key = req.headers["sec-websocket-key"];
-    if (typeof key !== "string" || !req.headers.upgrade || req.headers.upgrade.toLowerCase() !== "websocket") {
+    const version = req.headers["sec-websocket-version"];
+    if (
+      typeof key !== "string" ||
+      !isValidWebSocketKey(key) ||
+      version !== "13" ||
+      !req.headers.upgrade ||
+      req.headers.upgrade.toLowerCase() !== "websocket"
+    ) {
       socket.write("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
@@ -322,9 +358,17 @@ export class RelayHub {
     const peer = new WebSocketPeer(socket);
     let room = this.#rooms.get(roomId);
     if (!room) {
-      room = new Room(roomId);
+      room = new Room(roomId, (emptyRoomId) => this.#rooms.delete(emptyRoomId));
       this.#rooms.set(roomId, room);
     }
     room.attach(peer);
+  }
+}
+
+function isValidWebSocketKey(key: string): boolean {
+  try {
+    return Buffer.from(key, "base64").length === 16;
+  } catch {
+    return false;
   }
 }
