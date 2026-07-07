@@ -54,6 +54,9 @@ export class ChatRoom {
     if (!isValidRoomId(roomId) || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return json(400, { error: "bad_request" });
     }
+    if (this.#roomId && this.#roomId !== roomId) {
+      return json(409, { error: "room_mismatch" });
+    }
     this.#roomId = roomId;
     const pair = new WebSocketPair();
     const client = pair[0];

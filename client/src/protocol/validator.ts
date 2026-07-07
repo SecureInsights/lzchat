@@ -170,7 +170,12 @@ function isTimestamp(value: unknown): value is number {
 }
 
 function isBase64Token(value: unknown, maxLength: number): value is string {
-  return typeof value === "string" && value.length <= maxLength && /^[A-Za-z0-9_-]*$/u.test(value);
+  return (
+    typeof value === "string" &&
+    value.length <= maxLength &&
+    value.length % 4 !== 1 &&
+    /^[A-Za-z0-9_-]*$/u.test(value)
+  );
 }
 
 export function validatePlainPayload(value: unknown, depth = 0): PlainPayload | null {

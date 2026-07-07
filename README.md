@@ -1,35 +1,48 @@
 # Secure Chat
 
-高保密临时端到端加密聊天系统。第一屏就是创建/加入房间入口，不做账号、历史消息、离线消息或服务端搜索。
+高保密临时端到端加密聊天系统。第一屏就是创建或加入房间入口，不做账号、历史消息、离线消息或服务端搜索。
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/SecureInsights/lzchat)
 
 ## 当前实现范围
 
-已实现 MVP 核心：
+已实现：
 
 - 256-bit `roomSeed`，不从房间名或用户密码直接派生房间 ID。
-- 单链接邀请和双通道邀请。
-- URL fragment 读取后立即清理，秘密不进入 HTTP 请求。
+- 隐私性双通道邀请和公开单链接邀请。
+- 邀请 URL fragment 读取后立即清理，秘密不进入 HTTP 请求。
 - WebCrypto P-256 ECDH pairwise 会话。
 - HKDF domain separation。
 - 每个 peer 独立发送/接收 chain key。
 - 每条 relay 消息独立 message key、AAD 绑定和 AES-GCM 加密。
 - replay / out-of-order window 基础处理。
-- profile 和文本消息加密。
-- 成员安全码和房间安全码。
+- profile、文本、私聊、图片和文件 envelope 加密。
+- 图片粘贴、附件上传、图片消息直接预览和点击查看。
+- 文件分片传输、大小限制、接收端队列配额和 SHA-256 完整性校验。
+- 成员安全码和房间安全码展示。
+- 本地 emoji 数据，不使用运行时 CDN。
 - Cloudflare Workers + Static Assets + Durable Objects 配置。
 - 本地 Node 原生 WebSocket relay，无运行时依赖。
 - CSP 和安全响应头不包含 `unsafe-inline`。
-- Vitest 单元测试和 Playwright 空页面 E2E smoke。
+- Vitest 协议单元测试、Playwright 页面 smoke、local/worker health smoke。
 
-协议类型已预留图片、文件和私聊 envelope。完整文件分片、图片压缩、长期 identity key、WebAuthn 设备记忆和 cover traffic 属于后续阶段。
+仍未实现或仍需加强：
 
-## 规格优化
+- Argon2id 邀请 KDF。
+- 长期 identity key、签名身份和 WebAuthn 设备记忆。
+- 可持久化的人工核对状态。
+- cover traffic。
+- 流式文件读写、附件进度和断点重试。
+- 私聊、附件、篡改、重放、服务端滥用的完整 E2E 回归。
 
-1. 邀请 KDF 的 MVP 默认实现为 WebCrypto 原生 `PBKDF2-SHA256`，迭代数 600,000。这样可以避免为了 Argon2id 引入运行时 WASM/CDN。协议类型保留 `argon2id`，后续可在锁定 WASM 依赖和审计 lockfile 后切换。
+最新安全审计结论见 [SECURITY_AUDIT.md](./SECURITY_AUDIT.md)。
+
+## 协议说明
+
+1. 邀请 KDF 的当前实现为 WebCrypto 原生 `PBKDF2-SHA256`，迭代数 600,000。这样可以避免为了 Argon2id 引入运行时 WASM/CDN。协议类型保留 `argon2id`，后续可在锁定 WASM 依赖和审计 lockfile 后切换。
 2. 本地 Node relay 使用原生 HTTP upgrade 和 WebSocket 帧解析。部署形态仍保留 Cloudflare Worker/Durable Object；本地 smoke 不依赖 `ws` 包安装。
 3. 接收 ratchet 在解密失败时会把未接受的 skipped key 放回窗口，避免攻击者用未来序号坏密文让接收端永久失步。
+4. 当前 ratchet 提供会话内消息链前向安全：泄露当前 chain key 不能反推已擦除的历史 message key。但它不是完整 Double Ratchet；如果同时泄露房间秘密、会话私钥并掌握历史密文，历史消息风险会显著上升。
 
 ## 安装与运行
 
@@ -67,6 +80,26 @@ npm run deploy
 npm run smoke:worker -- --url=https://<worker-domain>
 ```
 
+## 自动部署
+
+如果在 Cloudflare Workers 里连接 GitHub 仓库，后续更新流程是：
+
+1. 修改代码并 push 到 GitHub 默认分支。
+2. Cloudflare 检测到新的 commit。
+3. Cloudflare 按项目设置执行安装和构建命令。
+4. 构建成功后自动发布新 Worker 和静态资源。
+
+推荐 Cloudflare 构建配置：
+
+```text
+Install command: npm ci
+Build command: npm run build
+Deploy command: npx wrangler deploy
+Output directory: dist
+```
+
+`wrangler.toml` 已配置 Static Assets、`/ws*`、`/api/*` 和 Durable Objects。通常不需要额外配置前端路由。
+
 ## 环境变量
 
 ```text
@@ -80,9 +113,10 @@ SECURE_CHAT_DEBUG=0
 
 - Web E2EE 的前提是用户信任当前加载的前端代码。
 - 临时聊天不是匿名通信网络。服务端仍可看到 IP、连接时间、消息大小、roomId 和房间活跃度。
-- 安全码只能确认当前会话密钥或当前对端指纹，不能证明真实身份。
-- 高保密使用时，应通过两条独立渠道分别发送邀请链接和口令。
+- 安全码只能辅助核对当前会话密钥或当前对端指纹，不能证明真实身份。
+- 隐私性模式使用时，应通过两条独立渠道分别发送邀请链接和口令。
 - 部署方、恶意浏览器扩展、被控设备和同房间恶意成员不在 Web 页面可完全防御范围内。
+- 当前没有长期身份签名，恶意服务端或恶意前端替换成员公钥时，只能依赖用户通过外部渠道核对安全码发现异常。
 
 ## 部署结构
 
@@ -117,11 +151,12 @@ Node static + WebSocket relay server
 ## 发布前检查
 
 - `npm ci` 使用 lockfile。
-- `npm audit --audit-level=moderate` 无 high/critical。
+- `npm audit --audit-level=moderate` 无 moderate/high/critical。
+- `npm run lint`、`npm test`、`npm run build`、`npm run test:e2e` 通过。
 - `debug=false`。
+- Vite `sourcemap=false`，除非确认 source map 不泄露敏感路径。
 - CSP 没有 `script-src 'unsafe-inline'`。
 - 没有 console 输出明文和密钥。
 - 没有 CDN 运行时依赖。
 - Worker 和 Node 协议版本一致。
-- E2E 双客户端测试通过。
 - 邀请链接 fragment 不进入 HTTP 请求。

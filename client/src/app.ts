@@ -155,6 +155,10 @@ const MAX_FILE_BATCH = 10;
 const MAX_FILE_BATCH_BYTES = 100 * 1024 * 1024;
 const FILE_CHUNK_BYTES = 256 * 1024;
 const FILE_RECEIVE_TIMEOUT_MS = 2 * 60 * 1000;
+const MAX_INCOMING_FILES_PER_PEER = 3;
+const MAX_INCOMING_FILES_TOTAL = 12;
+const MAX_INCOMING_RESERVED_BYTES = 100 * 1024 * 1024;
+const MAX_INCOMING_BUFFERED_BYTES = 64 * 1024 * 1024;
 const DISPLAY_IMAGE_MIME_RE = /^image\/(?:png|jpeg|jpg|gif|webp|avif|bmp)$/u;
 const EMOJI_CATEGORIES: EmojiCategory[] = [
   { group: 0, icon: "😀", label: "表情" },
@@ -273,6 +277,14 @@ function arrayBufferToBytes(buffer: ArrayBuffer): Uint8Array {
   return new Uint8Array(buffer);
 }
 
+function tryBase64urlDecode(value: string): Uint8Array | null {
+  try {
+    return base64urlDecode(value);
+  } catch {
+    return null;
+  }
+}
+
 async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", asBufferSource(bytes)));
 }
@@ -383,7 +395,9 @@ function destroyRuntime(): void {
   zeroize(state.room.fileKey);
   state.peers.clear();
   state.pendingRelays.clear();
-  state.incomingFiles.clear();
+  for (const key of [...state.incomingFiles.keys()]) {
+    deleteIncomingFile(state, key);
+  }
   for (const message of state.messages) {
     revokeMessageResources(message);
   }
@@ -423,13 +437,46 @@ function acceptPeerRate(peer: PeerRuntime): boolean {
   return peer.messageWindow.length <= PEER_MAX_MESSAGES_PER_WINDOW;
 }
 
+function zeroizeIncomingFile(file: IncomingFile): void {
+  for (const part of file.parts) {
+    if (part) {
+      zeroize(part);
+    }
+  }
+  file.parts.length = 0;
+  file.received = 0;
+  file.receivedBytes = 0;
+}
+
+function deleteIncomingFile(state: Runtime, key: string): void {
+  const file = state.incomingFiles.get(key);
+  if (file) {
+    zeroizeIncomingFile(file);
+    state.incomingFiles.delete(key);
+  }
+}
+
 function pruneIncomingFiles(state: Runtime): void {
   const now = Date.now();
   for (const [key, file] of state.incomingFiles) {
     if (now - file.startedAt > FILE_RECEIVE_TIMEOUT_MS) {
-      state.incomingFiles.delete(key);
+      deleteIncomingFile(state, key);
     }
   }
+}
+
+function incomingFileStats(state: Runtime, peerId?: string): { files: number; reservedBytes: number; bufferedBytes: number } {
+  let files = 0;
+  let reservedBytes = 0;
+  let bufferedBytes = 0;
+  for (const file of state.incomingFiles.values()) {
+    if (!peerId || file.from === peerId) {
+      files += 1;
+      reservedBytes += file.size;
+      bufferedBytes += file.receivedBytes;
+    }
+  }
+  return { files, reservedBytes, bufferedBytes };
 }
 
 function setNotice(container: HTMLElement, message: string, isError = false): void {
@@ -879,7 +926,10 @@ async function handlePlainPayload(
     if (!DISPLAY_IMAGE_MIME_RE.test(payload.mime)) {
       return;
     }
-    const bytes = base64urlDecode(payload.bytes);
+    const bytes = tryBase64urlDecode(payload.bytes);
+    if (!bytes) {
+      return;
+    }
     if (bytes.length > MAX_INLINE_IMAGE_BYTES) {
       addSystemMessage(`${peer.displayName} 发送的图片超过本机预览限制，已丢弃。`);
       return;
@@ -921,11 +971,23 @@ function handleFileMeta(
   scope: "room" | "private"
 ): void {
   pruneIncomingFiles(state);
+  const key = incomingFileKey(peer.clientId, payload.fileId);
+  deleteIncomingFile(state, key);
   if (
     payload.size > MAX_FILE_BYTES ||
     payload.chunks > Math.ceil(Math.max(payload.size, 1) / FILE_CHUNK_BYTES)
   ) {
     addSystemMessage(`${peer.displayName} 发送的文件超过限制，已拒绝接收。`);
+    return;
+  }
+  const peerStats = incomingFileStats(state, peer.clientId);
+  const totalStats = incomingFileStats(state);
+  if (
+    peerStats.files >= MAX_INCOMING_FILES_PER_PEER ||
+    totalStats.files >= MAX_INCOMING_FILES_TOTAL ||
+    totalStats.reservedBytes + payload.size > MAX_INCOMING_RESERVED_BYTES
+  ) {
+    addSystemMessage(`${peer.displayName} 发送的文件超过本机接收队列限制，已拒绝接收。`);
     return;
   }
   const incoming: IncomingFile = {
@@ -946,7 +1008,7 @@ function handleFileMeta(
   if (scope === "private") {
     incoming.peerName = peer.displayName;
   }
-  state.incomingFiles.set(incomingFileKey(peer.clientId, payload.fileId), incoming);
+  state.incomingFiles.set(key, incoming);
 }
 
 function handleFileChunk(
@@ -959,9 +1021,19 @@ function handleFileChunk(
   if (!incoming || payload.total !== incoming.chunks || incoming.parts[payload.index]) {
     return;
   }
-  const bytes = base64urlDecode(payload.bytes);
-  if (bytes.length > FILE_CHUNK_BYTES || incoming.receivedBytes + bytes.length > incoming.size) {
-    state.incomingFiles.delete(incomingFileKey(from, payload.fileId));
+  const bytes = tryBase64urlDecode(payload.bytes);
+  if (!bytes) {
+    deleteIncomingFile(state, incomingFileKey(from, payload.fileId));
+    return;
+  }
+  const totalStats = incomingFileStats(state);
+  if (
+    bytes.length > FILE_CHUNK_BYTES ||
+    incoming.receivedBytes + bytes.length > incoming.size ||
+    totalStats.bufferedBytes + bytes.length > MAX_INCOMING_BUFFERED_BYTES
+  ) {
+    zeroize(bytes);
+    deleteIncomingFile(state, incomingFileKey(from, payload.fileId));
     return;
   }
   incoming.parts[payload.index] = bytes;
@@ -987,11 +1059,15 @@ async function handleFileDone(
   const bytes = concatBytes(...parts);
   const digest = await sha256(bytes);
   if (bytes.length !== incoming.size || base64urlEncode(digest) !== payload.sha256) {
-    state.incomingFiles.delete(key);
+    zeroize(bytes);
+    zeroize(digest);
+    deleteIncomingFile(state, key);
     addSystemMessage(`${incoming.author} 发送的文件完整性校验失败，已丢弃。`);
     return;
   }
   const blob = new Blob([asBufferSource(bytes)], { type: incoming.mime });
+  zeroize(bytes);
+  zeroize(digest);
   const message: ChatMessage = {
     id: `${from}:file:${payload.fileId}`,
     own: false,
@@ -1007,7 +1083,7 @@ async function handleFileDone(
   if (incoming.peerName) {
     message.peerName = incoming.peerName;
   }
-  state.incomingFiles.delete(key);
+  deleteIncomingFile(state, key);
   pushMessage(state, message);
   renderChat();
 }

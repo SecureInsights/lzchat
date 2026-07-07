@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { validateJoinMessage, validateRelayEnvelope } from "../../client/src/protocol/validator";
+import { validateJoinMessage, validatePlainPayload, validateRelayEnvelope } from "../../client/src/protocol/validator";
 
 const roomId = "abcdefghijklmnop";
 const clientA = "clientclientclientA";
@@ -63,5 +63,36 @@ describe("envelope validator", () => {
         () => false
       )
     ).toBeNull();
+  });
+
+  it("rejects invalid base64url payload lengths", () => {
+    expect(
+      validatePlainPayload({
+        type: "image",
+        mime: "image/png",
+        bytes: "A",
+        createdAt: 1
+      })
+    ).toBeNull();
+
+    expect(
+      validatePlainPayload({
+        type: "file-chunk",
+        fileId: "filefilefilefile",
+        index: 0,
+        total: 1,
+        bytes: "A"
+      })
+    ).toBeNull();
+
+    expect(
+      validatePlainPayload({
+        type: "file-chunk",
+        fileId: "filefilefilefile",
+        index: 0,
+        total: 1,
+        bytes: "AAA"
+      })
+    ).not.toBeNull();
   });
 });
