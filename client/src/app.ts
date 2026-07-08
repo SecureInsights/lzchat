@@ -1,6 +1,6 @@
 import "./style.css";
 import emojiDataUrl from "emoji-picker-element-data/zh/emojibase/data.json?url";
-import { APP_NAME, BUILD_HASH, PROTOCOL_VERSION, wsUrlForRoom } from "./config";
+import { APP_NAME, wsUrlForRoom } from "./config";
 import { base64urlDecode, base64urlEncode } from "./crypto/base64url";
 import { peerFingerprint, roomSafetyCode, rosterDigest } from "./crypto/fingerprint";
 import {
@@ -585,7 +585,7 @@ function renderLogin(): void {
   const panel = el("div", { className: "login-panel" });
   const brand = el("div", { className: "brand" }, [
     el("span", { className: "brand-mark", text: "S" }),
-    APP_NAME
+    el("span", { text: APP_NAME })
   ]);
   const desc = decodedInvite
     ? el("p", { className: "subtle", text: "输入口令后即可进入。" })
@@ -1479,84 +1479,85 @@ async function sendFiles(files: readonly File[]): Promise<void> {
   }
 }
 
-function renderChat(): void {
-  const state = runtime;
-  if (!state) {
-    renderLogin();
-    return;
-  }
-  const layout = el("section", { className: "chat-layout" });
+function renderSidebar(state: Runtime): HTMLElement {
   const sidebar = el("aside", { className: "sidebar" });
-  const roomHead = el("div", { className: "room-head" });
-  roomHead.append(
+  const roomHead = el("div", { className: "room-head" }, [
     el("div", { className: "room-title", text: state.roomName }),
     el("div", { className: "safety-line", text: `房间安全码 ${state.safetyCode}` }),
     el("div", {
       className: "safety-line",
       text: state.mode === "two-channel" ? "双通道邀请" : "单链接邀请"
     })
-  );
-  const memberList = el("div", { className: "member-list" });
-  const self = el("button", {
+  ]);
+  const memberList = el("div", { className: "member-list" }, [renderRoomMember(state)]);
+  for (const peer of state.peers.values()) {
+    memberList.append(renderPeerMember(state, peer));
+  }
+  sidebar.append(roomHead, memberList);
+  return sidebar;
+}
+
+function renderRoomMember(state: Runtime): HTMLElement {
+  const item = el("button", {
     className: state.privatePeerId ? "member member-button" : "member member-button active",
     title: "切回房间",
     ariaLabel: "切回房间"
   });
-  self.addEventListener("click", () => {
+  item.addEventListener("click", () => {
     state.privatePeerId = null;
     state.roomUnread = 0;
     renderChat();
   });
-  const roomBadge =
+  const badge =
     state.roomUnread > 0
       ? el("span", { className: "badge unread", text: unreadLabel(state.roomUnread) })
       : el("span", { className: "badge ok", text: "房间" });
-  self.append(
+  item.append(
     el("span", { className: "member-avatar", text: avatarText(state.roomName) }),
     el("span", { className: "member-content" }, [
-      el("span", { className: "member-name" }, [state.roomName]),
-      el("span", { className: "member-subtitle", text: "房间" })
+      el("span", { className: "member-name", text: state.roomName }),
+      el("span", { className: "member-subtitle", text: "所有在线成员" })
     ]),
-    roomBadge
+    badge
   );
-  memberList.append(self);
-  for (const peer of state.peers.values()) {
-    const isPrivateTarget = state.privatePeerId === peer.clientId;
-    const item = el("button", {
-      className: isPrivateTarget ? "member member-button active" : "member member-button",
-      title: `私聊 ${peer.displayName}`,
-      ariaLabel: `私聊 ${peer.displayName}`
-    });
-    setDataset(item, "clientId", peer.clientId);
-    item.addEventListener("click", () => {
-      state.privatePeerId = peer.clientId;
-      state.privateUnread.delete(peer.clientId);
-      renderChat();
-    });
-    const unread = state.privateUnread.get(peer.clientId) ?? 0;
-    const badge = unread > 0
+  return item;
+}
+
+function renderPeerMember(state: Runtime, peer: PeerRuntime): HTMLElement {
+  const isPrivateTarget = state.privatePeerId === peer.clientId;
+  const item = el("button", {
+    className: isPrivateTarget ? "member member-button active" : "member member-button",
+    title: `私聊 ${peer.displayName}`,
+    ariaLabel: `私聊 ${peer.displayName}`
+  });
+  setDataset(item, "clientId", peer.clientId);
+  item.addEventListener("click", () => {
+    state.privatePeerId = peer.clientId;
+    state.privateUnread.delete(peer.clientId);
+    renderChat();
+  });
+  const unread = state.privateUnread.get(peer.clientId) ?? 0;
+  const badge =
+    unread > 0
       ? el("span", { className: "badge unread", text: unreadLabel(unread) })
       : isPrivateTarget
-      ? el("span", { className: "badge ok", text: "私聊" })
-      : el("span", { className: "badge", text: "在线" });
-    item.append(
-      el("span", { className: "member-avatar", text: avatarText(peer.displayName) }),
-      el("span", { className: "member-content" }, [
-        el("span", { className: "member-name", text: peer.displayName }),
-        el("span", {
-          className: "member-subtitle",
-          text: isPrivateTarget ? "当前私聊" : "点击私聊"
-        })
-      ]),
-      badge
-    );
-    memberList.append(item);
-  }
-  sidebar.append(roomHead, memberList);
+        ? el("span", { className: "badge ok", text: "私聊" })
+        : el("span", { className: "badge", text: "在线" });
+  item.append(
+    el("span", { className: "member-avatar", text: avatarText(peer.displayName) }),
+    el("span", { className: "member-content" }, [
+      el("span", { className: "member-name", text: peer.displayName }),
+      el("span", {
+        className: "member-subtitle",
+        text: isPrivateTarget ? "当前私聊" : "点击私聊"
+      })
+    ]),
+    badge
+  );
+  return item;
+}
 
-  const main = el("section", { className: "chat-main" });
-  const topbar = el("header", { className: "topbar" });
-  const privatePeer = state.privatePeerId ? state.peers.get(state.privatePeerId) : null;
+function renderTopbar(state: Runtime, privatePeer: PeerRuntime | null): HTMLElement {
   const modeText = privatePeer ? `私聊：${privatePeer.displayName}` : "房间";
   const status = el("div", { className: "chat-heading" }, [
     el("div", {
@@ -1568,7 +1569,7 @@ function renderChat(): void {
       text: `${state.status} · ${state.peers.size + 1} 人在线 · ${modeText}`
     })
   ]);
-  const topbarButtons: Node[] = [];
+  const actions: Node[] = [];
   const notifications = el("button", {
     className: state.notificationsEnabled || state.soundEnabled ? "secondary active" : "secondary",
     text: notificationButtonText(state)
@@ -1577,82 +1578,100 @@ function renderChat(): void {
   notifications.addEventListener("click", () => {
     void enableRoomNotifications();
   });
-  topbarButtons.push(notifications);
+  actions.push(notifications);
   if (state.inviteLink) {
     const invite = el("button", { className: "secondary", text: "邀请" });
     invite.addEventListener("click", () =>
       showInviteDialog(state.inviteLink!, state.invitePassphrase, state.inviteMode)
     );
-    topbarButtons.push(invite);
+    actions.push(invite);
   }
   const security = el("button", { className: "secondary", text: "安全详情" });
   security.addEventListener("click", showSecurityDetails);
-  topbarButtons.push(security);
+  actions.push(security);
   const leave = el("button", { className: "secondary", text: "退出房间" });
   leave.addEventListener("click", () => {
     destroyRuntime();
     renderLogin();
   });
-  topbarButtons.push(leave);
-  topbar.append(status, el("div", { className: "topbar-actions" }, topbarButtons));
+  actions.push(leave);
+  return el("header", { className: "topbar" }, [status, el("div", { className: "topbar-actions" }, actions)]);
+}
 
-  const modeBanner = el("div", {
+function renderModeBanner(privatePeer: PeerRuntime | null): HTMLElement {
+  return el("div", {
     className: privatePeer ? "mode-banner private" : "mode-banner room",
-    text: privatePeer
-      ? `私聊模式：消息只发送给 ${privatePeer.displayName}`
-      : "房间模式：消息会发送给所有在线成员"
+    text: privatePeer ? `私聊模式：消息只发送给 ${privatePeer.displayName}` : "房间模式：消息会发送给所有在线成员"
   });
+}
 
+function renderMessageList(state: Runtime): HTMLElement {
   const messages = el("div", { className: "messages" });
   for (const message of state.messages) {
-    const row = el("article", {
-      className: ["message", message.own ? "own" : "", message.scope].filter(Boolean).join(" ")
-    });
-    const scopeText =
-      message.scope === "private"
-        ? `私聊${message.peerName ? ` · ${message.peerName}` : ""}`
-        : "房间";
-    const metaText = `${message.author} · ${scopeText} · ${new Date(message.createdAt).toLocaleTimeString()}`;
-    row.append(el("div", { className: "message-meta", text: metaText }));
-    if (message.kind === "image" && message.imageUrl) {
-      const image = el("img", {
-        className: "message-image",
-        title: message.text ?? "图片"
-      });
-      image.src = message.imageUrl;
-      image.alt = message.text ?? "图片";
-      image.tabIndex = 0;
-      image.setAttribute("role", "button");
-      image.addEventListener("click", () => showImageViewer(message.imageUrl!, image.alt));
-      image.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          showImageViewer(message.imageUrl!, image.alt);
-        }
-      });
-      row.append(image);
-    } else if (message.kind === "file" && message.fileBlob) {
-      const fileBox = el("div", { className: "file-message" });
-      const fileInfo = el("div", { className: "file-info" }, [
-        el("div", { className: "file-name", text: message.fileName ?? "附件" }),
-        el("div", {
-          className: "file-size",
-          text: formatBytes(message.fileSize ?? message.fileBlob.size)
-        })
-      ]);
-      const download = el("button", { className: "file-download", text: "下载" });
-      download.type = "button";
-      download.addEventListener("click", () => {
-        safeDownload(message.fileBlob!, message.fileName ?? "attachment.bin");
-      });
-      fileBox.append(el("div", { className: "file-icon", text: "📎" }), fileInfo, download);
-      row.append(fileBox);
-    } else {
-      row.append(el("div", { className: "message-text", text: message.text ?? "" }));
-    }
-    messages.append(row);
+    messages.append(renderMessageRow(message));
   }
+  return messages;
+}
 
+function renderMessageRow(message: ChatMessage): HTMLElement {
+  const row = el("article", {
+    className: ["message", message.own ? "own" : "", message.scope].filter(Boolean).join(" ")
+  });
+  const scopeText =
+    message.scope === "private" ? `私聊${message.peerName ? ` · ${message.peerName}` : ""}` : "房间";
+  row.append(
+    el("div", {
+      className: "message-meta",
+      text: `${message.author} · ${scopeText} · ${new Date(message.createdAt).toLocaleTimeString()}`
+    })
+  );
+  if (message.kind === "image" && message.imageUrl) {
+    row.append(renderImageMessage(message));
+  } else if (message.kind === "file" && message.fileBlob) {
+    row.append(renderFileMessage(message));
+  } else {
+    row.append(el("div", { className: "message-text", text: message.text ?? "" }));
+  }
+  return row;
+}
+
+function renderImageMessage(message: ChatMessage): HTMLImageElement {
+  const image = el("img", {
+    className: "message-image",
+    title: message.text ?? "图片"
+  });
+  image.src = message.imageUrl!;
+  image.alt = message.text ?? "图片";
+  image.tabIndex = 0;
+  image.setAttribute("role", "button");
+  image.addEventListener("click", () => showImageViewer(message.imageUrl!, image.alt));
+  image.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      showImageViewer(message.imageUrl!, image.alt);
+    }
+  });
+  return image;
+}
+
+function renderFileMessage(message: ChatMessage): HTMLElement {
+  const fileBlob = message.fileBlob!;
+  const fileInfo = el("div", { className: "file-info" }, [
+    el("div", { className: "file-name", text: message.fileName ?? "附件" }),
+    el("div", {
+      className: "file-size",
+      text: formatBytes(message.fileSize ?? fileBlob.size)
+    })
+  ]);
+  const download = el("button", { className: "file-download", text: "下载" });
+  download.type = "button";
+  download.addEventListener("click", () => {
+    safeDownload(fileBlob, message.fileName ?? "attachment.bin");
+  });
+  return el("div", { className: "file-message" }, [el("div", { className: "file-icon", text: "📎" }), fileInfo, download]);
+}
+
+function renderComposer(): HTMLElement {
   const composer = el("form", { className: "composer" });
   const composerPill = el("div", { className: "composer-pill" });
   const emojiWrap = el("div", { className: "emoji-wrap" });
@@ -1678,8 +1697,10 @@ function renderChat(): void {
   });
   input.rows = 1;
   const syncInputHeight = () => {
+    const maxHeight = 112;
     input.style.height = "auto";
-    input.style.height = `${Math.min(input.scrollHeight, 112)}px`;
+    input.style.overflowY = input.scrollHeight > maxHeight ? "auto" : "hidden";
+    input.style.height = `${Math.min(input.scrollHeight, maxHeight)}px`;
   };
 
   const renderEmojiCategories = () => {
@@ -1832,10 +1853,23 @@ function renderChat(): void {
   });
   composerPill.append(emojiWrap, input, attach, fileInput);
   composer.append(composerPill, send);
-  main.append(topbar, modeBanner, messages, composer);
-  layout.append(sidebar, main);
-  setApp(layout);
   syncInputHeight();
+  return composer;
+}
+
+function renderChat(): void {
+  const state = runtime;
+  if (!state) {
+    renderLogin();
+    return;
+  }
+  const privatePeer = state.privatePeerId ? state.peers.get(state.privatePeerId) ?? null : null;
+  const layout = el("section", { className: "chat-layout" });
+  const main = el("section", { className: "chat-main" });
+  const messages = renderMessageList(state);
+  main.append(renderTopbar(state, privatePeer), renderModeBanner(privatePeer), messages, renderComposer());
+  layout.append(renderSidebar(state), main);
+  setApp(layout);
   messages.scrollTop = messages.scrollHeight;
 }
 
@@ -1938,7 +1972,6 @@ function showSecurityDetails(): void {
   close.addEventListener("click", () => backdrop.remove());
   dialog.append(
     el("h2", { text: "安全详情" }),
-    el("p", { className: "subtle", text: `协议 V${PROTOCOL_VERSION} · Build ${BUILD_HASH}` }),
     el("div", { className: "safety-line", text: `房间安全码：${state.safetyCode}` }),
     el("div", {
       className: "warning",
