@@ -1,4 +1,4 @@
-import type { JoinMessage, ServerMessage } from "../protocol/types";
+import type { JoinMessage, PingMessage, ServerMessage } from "../protocol/types";
 import { parseJsonObject, validateServerMessage } from "../protocol/validator";
 
 export type WsClientHandlers = {
@@ -13,6 +13,7 @@ export class WsClient {
   #closed = false;
   #attempt = 0;
   #reconnectTimer: number | null = null;
+  #heartbeatTimer: number | null = null;
 
   constructor(
     private readonly url: string,
@@ -33,6 +34,7 @@ export class WsClient {
       this.#attempt = 0;
       this.handlers.status("已连接");
       this.send(this.joinMessage);
+      this.startHeartbeat();
       this.handlers.open();
     });
     socket.addEventListener("message", (event) => {
@@ -55,6 +57,7 @@ export class WsClient {
       if (this.#socket === socket) {
         this.#socket = null;
       }
+      this.stopHeartbeat();
       this.handlers.close();
       if (!this.#closed) {
         this.handlers.status("已断开，正在重连");
@@ -88,11 +91,32 @@ export class WsClient {
 
   close(): void {
     this.#closed = true;
+    this.stopHeartbeat();
     if (this.#reconnectTimer !== null) {
       window.clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = null;
     }
     this.#socket?.close(1000, "client closing");
     this.#socket = null;
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.#heartbeatTimer = window.setInterval(() => {
+      const ping: PingMessage = {
+        v: 3,
+        t: "ping",
+        roomId: this.joinMessage.roomId,
+        clientId: this.joinMessage.clientId
+      };
+      this.send(ping);
+    }, 25_000);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.#heartbeatTimer !== null) {
+      window.clearInterval(this.#heartbeatTimer);
+      this.#heartbeatTimer = null;
+    }
   }
 }

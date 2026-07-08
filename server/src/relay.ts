@@ -14,6 +14,7 @@ import {
   isValidRoomId,
   parseJsonObject,
   validateJoinMessage,
+  validatePingMessage,
   validateRelayEnvelope,
   type CapabilitySet,
   type JoinMessage
@@ -276,6 +277,9 @@ class Room {
 
   private onClientMessage(state: ClientState, parsed: Record<string, unknown> | null): void {
     state.seenAt = Date.now();
+    if (validatePingMessage(parsed, this.roomId, state.clientId)) {
+      return;
+    }
     const relay = validateRelayEnvelope(parsed, this.roomId, state.clientId, (clientId) => this.clients.has(clientId));
     if (!relay) {
       this.bad(state);

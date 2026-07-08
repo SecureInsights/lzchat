@@ -12,6 +12,7 @@ import {
   isValidRoomId,
   parseJsonObject,
   validateJoinMessage,
+  validatePingMessage,
   validateRelayEnvelope,
   type CapabilitySet,
   type JoinMessage
@@ -103,6 +104,9 @@ export class ChatRoom {
       return;
     }
     state.seenAt = Date.now();
+    if (validatePingMessage(parsed, this.#roomId, state.clientId)) {
+      return;
+    }
     const relay = validateRelayEnvelope(parsed, this.#roomId, state.clientId, (clientId) => this.#clients.has(clientId));
     if (!relay) {
       this.bad(socket);

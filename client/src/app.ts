@@ -60,6 +60,8 @@ type PeerRuntime = {
   messageWindow: number[];
   mediaMessageWindow: number[];
   mediaByteWindow: Array<{ seenAt: number; bytes: number }>;
+  seenControlSeq: Set<number>;
+  lastIncomingCallOfferAt: number;
   decryptFailures: number;
   lastFailureNoticeAt: number;
 };
@@ -374,6 +376,9 @@ const CALL_MAX_MEDIA_SEND_FAILURES = 8;
 const CALL_MAX_AUDIO_QUEUE_DELAY_SEC = 0.8;
 const CALL_INCOMING_TIMEOUT_MS = 60_000;
 const CALL_RINGTONE_INTERVAL_MS = 1_700;
+const CALL_CONTROL_REPLAY_WINDOW = 256;
+const CALL_CONTROL_MAX_AGE_MS = 5 * 60 * 1000;
+const CALL_OFFER_COOLDOWN_MS = 30_000;
 const MAX_INLINE_IMAGE_BYTES = 3 * 1024 * 1024;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_FILE_BATCH = 10;
@@ -1294,6 +1299,8 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       messageWindow: existing?.messageWindow ?? [],
       mediaMessageWindow: existing?.mediaMessageWindow ?? [],
       mediaByteWindow: existing?.mediaByteWindow ?? [],
+      seenControlSeq: existing?.seenControlSeq ?? new Set(),
+      lastIncomingCallOfferAt: existing?.lastIncomingCallOfferAt ?? 0,
       decryptFailures: 0,
       lastFailureNoticeAt: 0
     });
@@ -1397,7 +1404,7 @@ async function handleRelay(envelope: RelayEnvelope, allowQueue = true): Promise<
   }
   if (envelope.kind === "call-control") {
     const control = await openCallControlEnvelope(envelope, peer);
-    if (control) {
+    if (control && acceptCallControl(peer, envelope.seq, control.createdAt)) {
       await handleCallSignal(state, peer, control);
     }
     return;
@@ -1906,6 +1913,26 @@ function nextControlSeq(): number {
   return Date.now() * 1_000 + Math.floor(Math.random() * 1_000);
 }
 
+function acceptCallControl(peer: PeerRuntime, seq: number, createdAt: number): boolean {
+  const now = Date.now();
+  if (!Number.isSafeInteger(seq) || seq <= 0 || Math.abs(now - createdAt) > CALL_CONTROL_MAX_AGE_MS) {
+    return false;
+  }
+  if (peer.seenControlSeq.has(seq)) {
+    return false;
+  }
+  peer.seenControlSeq.add(seq);
+  if (peer.seenControlSeq.size > CALL_CONTROL_REPLAY_WINDOW) {
+    const minRetained = seq - CALL_CONTROL_REPLAY_WINDOW;
+    for (const item of [...peer.seenControlSeq]) {
+      if (item < minRetained) {
+        peer.seenControlSeq.delete(item);
+      }
+    }
+  }
+  return true;
+}
+
 function isCallControlPayload(value: unknown): value is CallControlPayload {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return false;
@@ -2391,10 +2418,19 @@ async function handleCallSignal(
     if (hasEndedCall(state, peer.clientId, payload.callId)) {
       return;
     }
+    if (state.call?.callId === payload.callId && state.call.peerId === peer.clientId) {
+      return;
+    }
     if (state.call && state.call.callId !== payload.callId) {
       sendCallEndSignal(state, peer, payload.callId, "busy");
       return;
     }
+    const now = Date.now();
+    if (now - peer.lastIncomingCallOfferAt < CALL_OFFER_COOLDOWN_MS) {
+      sendCallEndSignal(state, peer, payload.callId, "busy");
+      return;
+    }
+    peer.lastIncomingCallOfferAt = now;
     if (payload.targetIds && payload.targetIds.length > 0 && !payload.targetIds.includes(state.clientId)) {
       return;
     }

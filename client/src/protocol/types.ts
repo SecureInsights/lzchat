@@ -17,6 +17,13 @@ export type JoinMessage = {
   capabilities: CapabilitySet;
 };
 
+export type PingMessage = {
+  v: 3;
+  t: "ping";
+  roomId: string;
+  clientId: string;
+};
+
 export type MembersMessage = {
   v: 3;
   t: "members";

@@ -39,6 +39,7 @@ export const MAX_FILE_NAME_CHARS = 180;
 export const MAX_CALL_REASON_CHARS = 120;
 export const MAX_CALL_VIDEO_BYTES_B64 = Math.ceil((128 * 1024 * 4) / 3) + 4;
 export const MAX_CALL_AUDIO_BYTES_B64 = Math.ceil((16 * 1024 * 4) / 3) + 4;
+export const MAX_CALL_MEDIA_CT_CHARS = 384 * 1024;
 
 const INLINE_IMAGE_MIME_RE = /^image\/(?:png|jpeg|jpg|gif|webp|avif|bmp)$/u;
 const MIME_TYPE_RE = /^[a-z][a-z0-9]*\/[a-z][a-z0-9]*(?:[.+-][a-z0-9]+)*$/u;
@@ -177,7 +178,8 @@ export function validateRelayEnvelope(
   if (!isValidSmallToken(value.nonce)) {
     return null;
   }
-  if (typeof value.ct !== "string" || value.ct.length === 0 || value.ct.length > MAX_RELAY_SIZE) {
+  const maxCtLength = value.kind === "call-media" ? MAX_CALL_MEDIA_CT_CHARS : MAX_RELAY_SIZE;
+  if (typeof value.ct !== "string" || value.ct.length === 0 || value.ct.length > maxCtLength) {
     return null;
   }
   return value as RelayEnvelope;

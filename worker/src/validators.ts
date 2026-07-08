@@ -15,6 +15,13 @@ export type JoinMessage = {
   capabilities: CapabilitySet;
 };
 
+export type PingMessage = {
+  v: 3;
+  t: "ping";
+  roomId: string;
+  clientId: string;
+};
+
 export type RelayKind =
   | "profile"
   | "text"
@@ -48,6 +55,7 @@ export const RATE_WINDOW_MS = 10_000;
 export const MAX_BAD_MESSAGES = 8;
 export const CLIENT_TIMEOUT_MS = 90_000;
 export const JOIN_TIMEOUT_MS = 10_000;
+export const MAX_CALL_MEDIA_CT_CHARS = 384 * 1024;
 
 export const ROOM_ID_RE = /^[A-Za-z0-9_-]{16,64}$/u;
 export const CLIENT_ID_RE = /^[A-Za-z0-9_-]{16,128}$/u;
@@ -119,6 +127,23 @@ export function validateJoinMessage(value: unknown, expectedRoomId: string): Joi
   return value as JoinMessage;
 }
 
+export function validatePingMessage(
+  value: unknown,
+  expectedRoomId: string,
+  expectedClientId: string
+): PingMessage | null {
+  if (!isObject(value) || value.v !== 3 || value.t !== "ping") {
+    return null;
+  }
+  if (typeof value.roomId !== "string" || value.roomId !== expectedRoomId || !ROOM_ID_RE.test(value.roomId)) {
+    return null;
+  }
+  if (typeof value.clientId !== "string" || value.clientId !== expectedClientId || !CLIENT_ID_RE.test(value.clientId)) {
+    return null;
+  }
+  return value as PingMessage;
+}
+
 export function validateRelayEnvelope(
   value: unknown,
   expectedRoomId: string,
@@ -147,7 +172,8 @@ export function validateRelayEnvelope(
   if (typeof value.nonce !== "string" || !SMALL_TOKEN_RE.test(value.nonce)) {
     return null;
   }
-  if (typeof value.ct !== "string" || value.ct.length === 0 || value.ct.length > MAX_RELAY_SIZE) {
+  const maxCtLength = value.kind === "call-media" ? MAX_CALL_MEDIA_CT_CHARS : MAX_RELAY_SIZE;
+  if (typeof value.ct !== "string" || value.ct.length === 0 || value.ct.length > maxCtLength) {
     return null;
   }
   return value as RelayEnvelope;
