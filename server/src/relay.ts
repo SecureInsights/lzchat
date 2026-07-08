@@ -243,8 +243,12 @@ class Room {
   private join(socket: WebSocketPeer, join: JoinMessage): ClientState | null {
     const existing = this.clients.get(join.clientId);
     if (existing) {
-      socket.close(1008, "duplicate_client_id");
-      return null;
+      if (existing.sessionPub !== join.sessionPub) {
+        socket.close(1008, "duplicate_client_id");
+        return null;
+      }
+      this.clients.delete(join.clientId);
+      existing.socket.close(1001, "replaced");
     }
     if (this.clients.size >= MAX_ROOM_MEMBERS) {
       socket.close(1013, "room_full");

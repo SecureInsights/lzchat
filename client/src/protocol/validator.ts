@@ -29,6 +29,7 @@ export const RELAY_KINDS: ReadonlySet<RelayKind> = new Set([
 
 export const MAX_TEXT_CHARS = 8_000;
 export const MAX_DISPLAY_NAME_CHARS = 40;
+export const MAX_ROOM_NAME_CHARS = 60;
 export const MAX_IMAGE_BYTES_B64 = 8 * 1024 * 1024;
 export const MAX_FILE_BYTES = 25 * 1024 * 1024;
 export const FILE_CHUNK_BYTES = 256 * 1024;
@@ -247,6 +248,12 @@ export function validatePlainPayload(value: unknown, depth = 0): PlainPayload | 
   switch (value.type) {
     case "profile":
       if (typeof value.displayName !== "string" || value.displayName.length > MAX_DISPLAY_NAME_CHARS) {
+        return null;
+      }
+      if (
+        value.roomName !== undefined &&
+        (typeof value.roomName !== "string" || value.roomName.length > MAX_ROOM_NAME_CHARS)
+      ) {
         return null;
       }
       if (value.avatarSeed !== undefined && !isValidSmallToken(value.avatarSeed)) {

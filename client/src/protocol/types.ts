@@ -57,7 +57,7 @@ export type RelayEnvelope = {
 export type ServerMessage = MembersMessage | RelayEnvelope | { v: 3; t: "error"; code: string };
 
 export type PlainPayload =
-  | { type: "profile"; displayName: string; avatarSeed?: string; createdAt: number }
+  | { type: "profile"; displayName: string; roomName?: string; avatarSeed?: string; createdAt: number }
   | { type: "text"; text: string; createdAt: number }
   | { type: "image"; mime: string; bytes: string; createdAt: number }
   | { type: "file-meta"; fileId: string; name: string; mime: string; size: number; chunks: number; createdAt: number }

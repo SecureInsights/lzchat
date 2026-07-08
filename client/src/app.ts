@@ -290,6 +290,7 @@ type Runtime = {
   messages: ChatMessage[];
   status: string;
   safetyCode: string;
+  membersEpoch: number;
   privatePeerId: string | null;
   roomUnread: number;
   privateUnread: Map<string, number>;
@@ -361,6 +362,8 @@ const PEER_MAX_MESSAGES_PER_WINDOW = 120;
 const FAILURE_NOTICE_INTERVAL_MS = 5_000;
 const NOTIFICATION_THROTTLE_MS = 900;
 const MAX_PENDING_RELAYS_PER_PEER = 32;
+const MAX_ROOM_NAME_CHARS = 60;
+const DEFAULT_ROOM_NAME = "临时房间";
 const MEDIA_RATCHET_WINDOW = 1024;
 const MEDIA_MAX_SKIPPED_KEYS = 1024;
 const PEER_MAX_CALL_MEDIA_BYTES_PER_WINDOW = 6 * 1024 * 1024;
@@ -384,13 +387,13 @@ const DISPLAY_IMAGE_MIME_RE = /^image\/(?:png|jpeg|jpg|gif|webp|avif|bmp)$/u;
 const MIME_TYPE_RE = /^[a-z][a-z0-9]*\/[a-z][a-z0-9]*(?:[.+-][a-z0-9]+)*$/u;
 const DANGEROUS_DOWNLOAD_MIME_RE =
   /^(?:text\/html|text\/javascript|application\/(?:javascript|x-javascript|ecmascript|x-msdownload|x-sh|x-bat|x-csh)|image\/svg\+xml)$/u;
-const PEER_MAX_CALL_MEDIA_MESSAGES_PER_WINDOW = 600;
+const PEER_MAX_CALL_MEDIA_MESSAGES_PER_WINDOW = 1_200;
 const CALL_MEDIA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
-const CALL_VIDEO_WIDTH = 480;
-const CALL_VIDEO_HEIGHT = 270;
+const CALL_VIDEO_WIDTH = 640;
+const CALL_VIDEO_HEIGHT = 360;
 const CALL_VIDEO_FPS = 30;
-const CALL_VIDEO_BITRATE = 700_000;
-const CALL_VIDEO_BITRATES = [CALL_VIDEO_BITRATE, 500_000, 350_000];
+const CALL_VIDEO_BITRATE = 900_000;
+const CALL_VIDEO_BITRATES = [CALL_VIDEO_BITRATE, 700_000, 500_000];
 const CALL_VIDEO_HARDWARE_ACCELERATION: VideoEncoderConfigLike["hardwareAcceleration"][] = [
   "no-preference",
   "prefer-hardware",
@@ -1059,7 +1062,7 @@ function renderLogin(): void {
         setNotice(notice, "");
         action.disabled = true;
         const displayName = nameInput.value.trim().slice(0, 40) || "访客";
-        const roomName = roomInput.value.trim().slice(0, 60) || "临时房间";
+        const roomName = roomInput.value.trim().slice(0, MAX_ROOM_NAME_CHARS) || DEFAULT_ROOM_NAME;
         if (decodedInvite || inviteInput.value.trim()) {
           const inviteToken = parseInviteInput(inviteInput.value || pendingInviteToken || "");
           const invite = decodeInvite(inviteToken);
@@ -1182,6 +1185,7 @@ async function startRoom(input: {
     messages: [],
     status: "连接中",
     safetyCode: "计算中",
+    membersEpoch: 0,
     privatePeerId: null,
     roomUnread: 0,
     privateUnread: new Map(),
@@ -1217,6 +1221,9 @@ async function handleMembers(message: MembersMessage): Promise<void> {
   if (!state || message.roomId !== state.room.roomId) {
     return;
   }
+  state.membersEpoch += 1;
+  const membersEpoch = state.membersEpoch;
+  state.safetyCode = "计算中";
   state.members = message.members;
   const liveIds = new Set(message.members.map((member) => member.clientId));
   for (const [clientId, peer] of state.peers) {
@@ -1289,11 +1296,24 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       lastFailureNoticeAt: 0
     });
   }
-  const digest = await rosterDigest(message.members);
-  state.safetyCode = await roomSafetyCode(state.room.rosterKey, digest);
-  await processPendingRelays();
   renderChat();
   await sendProfilesToAll();
+  await processPendingRelays();
+  void updateRoomSafetyCode(state, message.members, membersEpoch);
+}
+
+async function updateRoomSafetyCode(
+  state: Runtime,
+  members: MembersMessage["members"],
+  membersEpoch: number
+): Promise<void> {
+  const digest = await rosterDigest(members);
+  const safetyCode = await roomSafetyCode(state.room.rosterKey, digest);
+  if (runtime !== state || state.membersEpoch !== membersEpoch) {
+    return;
+  }
+  state.safetyCode = safetyCode;
+  renderChat();
 }
 
 async function sendProfilesToAll(): Promise<void> {
@@ -1308,6 +1328,7 @@ async function sendProfilesToAll(): Promise<void> {
     const payload: PlainPayload = {
       type: "profile",
       displayName: state.displayName,
+      roomName: state.roomName,
       avatarSeed: state.clientId,
       createdAt: Date.now()
     };
@@ -1380,6 +1401,9 @@ async function handleRelay(envelope: RelayEnvelope, allowQueue = true): Promise<
   }
   if (payload.type === "profile") {
     peer.displayName = payload.displayName || peer.displayName;
+    if (payload.roomName && state.roomName === DEFAULT_ROOM_NAME) {
+      state.roomName = payload.roomName;
+    }
     renderChat();
     return;
   }
@@ -2049,6 +2073,24 @@ function rawMediaErrorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function drawVideoContain(
+  context: CanvasRenderingContext2D,
+  video: HTMLVideoElement,
+  width: number,
+  height: number
+): void {
+  const sourceWidth = video.videoWidth || width;
+  const sourceHeight = video.videoHeight || height;
+  const scale = Math.min(width / sourceWidth, height / sourceHeight);
+  const targetWidth = Math.max(1, Math.round(sourceWidth * scale));
+  const targetHeight = Math.max(1, Math.round(sourceHeight * scale));
+  const targetX = Math.floor((width - targetWidth) / 2);
+  const targetY = Math.floor((height - targetHeight) / 2);
+  context.fillStyle = "#111827";
+  context.fillRect(0, 0, width, height);
+  context.drawImage(video, 0, 0, sourceWidth, sourceHeight, targetX, targetY, targetWidth, targetHeight);
+}
+
 function isNotAllowedMediaError(error: unknown): boolean {
   return (
     typeof error === "object" &&
@@ -2487,6 +2529,13 @@ async function startEncodedVideo(
   video.playsInline = true;
   await video.play();
   publisher.captureVideo = video;
+  const captureCanvas = document.createElement("canvas");
+  captureCanvas.width = CALL_VIDEO_WIDTH;
+  captureCanvas.height = CALL_VIDEO_HEIGHT;
+  const captureContext = captureCanvas.getContext("2d", { alpha: false });
+  if (!captureContext) {
+    throw new Error("Canvas capture unavailable");
+  }
   publisher.videoConfig = await selectVideoConfig();
   publisher.videoEncoder = new codecs.VideoEncoder({
     output: (chunk) => {
@@ -2503,7 +2552,7 @@ async function startEncodedVideo(
     if (publisher.closed || runtime !== state || state.call !== call || !publisher.videoEncoder) {
       return;
     }
-    if (publisher.videoEncoder.encodeQueueSize < 3 && video.readyState >= 2) {
+    if (!call.cameraOff && publisher.videoEncoder.encodeQueueSize < 3 && video.readyState >= 2) {
       const timestamp = Math.round(
         metadata && Number.isFinite(metadata.mediaTime)
           ? (metadata.mediaTime ?? 0) * 1_000_000
@@ -2514,7 +2563,8 @@ async function startEncodedVideo(
         if (!FrameCtor) {
           return;
         }
-        const frame = new FrameCtor(video, { timestamp });
+        drawVideoContain(captureContext, video, CALL_VIDEO_WIDTH, CALL_VIDEO_HEIGHT);
+        const frame = new FrameCtor(captureCanvas, { timestamp });
         const keyFrame =
           publisher.lastKeyFrameAt === 0 || now - publisher.lastKeyFrameAt >= CALL_KEYFRAME_INTERVAL_MS;
         publisher.videoEncoder.encode(frame, { keyFrame });
@@ -2651,7 +2701,7 @@ async function sendEncodedAudioChunk(
   publisher: EncodedCallPublisher,
   chunk: EncodedChunkLike
 ): Promise<void> {
-  if (publisher.closed || runtime !== state || state.call !== call || !publisher.audioConfig) {
+  if (publisher.closed || runtime !== state || state.call !== call || !publisher.audioConfig || call.muted) {
     return;
   }
   const bytes = new Uint8Array(chunk.byteLength);
@@ -3557,7 +3607,10 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
       el("div", { className: "call-title", text: title }),
       el("div", {
         className: "call-subtitle",
-        text: call.media === "video" ? "端到端加密媒体流 · 480x270 · 30fps" : "端到端加密语音流"
+        text:
+          call.media === "video"
+            ? `端到端加密媒体流 · ${CALL_VIDEO_WIDTH}x${CALL_VIDEO_HEIGHT} · ${CALL_VIDEO_FPS}fps`
+            : "端到端加密语音流"
       })
     ])
   ]);
@@ -3593,23 +3646,30 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
   } else {
     const mute = el("button", { className: "call-control", text: call.muted ? "开麦" : "静音" });
     mute.type = "button";
-    mute.addEventListener("click", () => {
+    mute.addEventListener("click", (event) => {
       call.muted = !call.muted;
       call.localStream?.getAudioTracks().forEach((track) => {
         track.enabled = !call.muted;
       });
-      renderChat();
+      if (event.currentTarget instanceof HTMLButtonElement) {
+        event.currentTarget.textContent = call.muted ? "开麦" : "静音";
+      }
     });
     actions.append(mute);
     if (call.media === "video") {
       const camera = el("button", { className: "call-control", text: call.cameraOff ? "开镜头" : "关镜头" });
       camera.type = "button";
-      camera.addEventListener("click", () => {
+      camera.addEventListener("click", (event) => {
         call.cameraOff = !call.cameraOff;
         call.localStream?.getVideoTracks().forEach((track) => {
           track.enabled = !call.cameraOff;
         });
-        renderChat();
+        if (!call.cameraOff && call.publisher) {
+          call.publisher.lastKeyFrameAt = 0;
+        }
+        if (event.currentTarget instanceof HTMLButtonElement) {
+          event.currentTarget.textContent = call.cameraOff ? "开镜头" : "关镜头";
+        }
       });
       actions.append(camera);
     }
