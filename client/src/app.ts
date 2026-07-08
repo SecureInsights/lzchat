@@ -1,5 +1,6 @@
 import "./style.css";
 import emojiDataUrl from "emoji-picker-element-data/zh/emojibase/data.json?url";
+import { toCanvas } from "qrcode";
 import { APP_NAME, wsUrlForRoom } from "./config";
 import { aesGcmDecrypt, aesGcmEncrypt } from "./crypto/aead";
 import { base64urlDecode, base64urlEncode } from "./crypto/base64url";
@@ -261,6 +262,7 @@ type CallRuntime = {
   mediaSendFailures: number;
   mediaFailureNotified: boolean;
   incomingTimerId: number | null;
+  ringtoneTimerId: number | null;
   muted: boolean;
   cameraOff: boolean;
   createdAt: number;
@@ -367,6 +369,7 @@ const CALL_MAX_AUDIO_CHUNK_BYTES = 16 * 1024;
 const CALL_MAX_MEDIA_SEND_FAILURES = 8;
 const CALL_MAX_AUDIO_QUEUE_DELAY_SEC = 0.8;
 const CALL_INCOMING_TIMEOUT_MS = 60_000;
+const CALL_RINGTONE_INTERVAL_MS = 1_700;
 const MAX_INLINE_IMAGE_BYTES = 3 * 1024 * 1024;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_FILE_BATCH = 10;
@@ -408,6 +411,7 @@ const CALL_VIDEO_CODECS = [
   "avc1.4D401E",
   "avc1.64001E"
 ];
+const INVITE_QR_SIZE = 176;
 const ENDED_CALL_CACHE_MS = 5 * 60 * 1000;
 const MAX_ENDED_CALL_CACHE = 64;
 const CALL_END_RETRY_DELAYS_MS = [0, 250, 1_000];
@@ -489,6 +493,67 @@ function playNotificationSound(): void {
   gain.connect(context.destination);
   oscillator.start(now);
   oscillator.stop(now + 0.2);
+}
+
+function playCallRingtone(): boolean {
+  const context = notificationAudioContext;
+  if (!context || context.state !== "running") {
+    return false;
+  }
+  const now = context.currentTime;
+  const gain = context.createGain();
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.075, now + 0.02);
+  gain.gain.setValueAtTime(0.075, now + 0.5);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.62);
+  gain.connect(context.destination);
+
+  for (const [offset, frequency] of [
+    [0, 660],
+    [0.24, 520]
+  ] as const) {
+    const oscillator = context.createOscillator();
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(frequency, now + offset);
+    oscillator.connect(gain);
+    oscillator.addEventListener(
+      "ended",
+      () => {
+        oscillator.disconnect();
+      },
+      { once: true }
+    );
+    oscillator.start(now + offset);
+    oscillator.stop(now + offset + 0.28);
+  }
+
+  window.setTimeout(() => {
+    try {
+      gain.disconnect();
+    } catch {
+      // The audio context may already be closed while leaving the room.
+    }
+  }, 760);
+  return true;
+}
+
+function installNotificationSoundUnlock(): void {
+  const tryUnlock = () => {
+    void unlockNotificationSound()
+      .then((ready) => {
+        if (!ready) {
+          return;
+        }
+        if (runtime) {
+          runtime.soundEnabled = true;
+        }
+        document.removeEventListener("pointerdown", tryUnlock);
+        document.removeEventListener("keydown", tryUnlock);
+      })
+      .catch(() => undefined);
+  };
+  document.addEventListener("pointerdown", tryUnlock, { passive: true });
+  document.addEventListener("keydown", tryUnlock);
 }
 
 function closeNotificationAudio(): void {
@@ -1066,6 +1131,7 @@ async function startRoom(input: {
   const room = await deriveRoomSecrets(input.secret);
   const session = await generateSessionKeys();
   const clientId = base64urlEncode(randomBytes(16));
+  const soundReady = await unlockNotificationSound().catch(() => false);
   const capabilities: CapabilitySet = {
     ratchet: "v1",
     aead: "aes-gcm",
@@ -1125,7 +1191,7 @@ async function startRoom(input: {
     call: null,
     endedCalls: new Map(),
     notificationsEnabled: notificationPermission() === "granted",
-    soundEnabled: false,
+    soundEnabled: soundReady,
     lastNotificationAt: 0
   };
   renderChat();
@@ -1816,6 +1882,7 @@ function cleanupCall(call: CallRuntime | null): void {
   if (!call) {
     return;
   }
+  stopCallRingtone(call);
   if (call.incomingTimerId !== null) {
     window.clearTimeout(call.incomingTimerId);
     call.incomingTimerId = null;
@@ -1826,6 +1893,13 @@ function cleanupCall(call: CallRuntime | null): void {
   call.publisher = null;
   cleanupEncodedReceiver(call.receiver);
   call.remoteCanvas = null;
+}
+
+function stopCallRingtone(call: CallRuntime): void {
+  if (call.ringtoneTimerId !== null) {
+    window.clearInterval(call.ringtoneTimerId);
+    call.ringtoneTimerId = null;
+  }
 }
 
 function callPeer(state: Runtime, call: CallRuntime): PeerRuntime | null {
@@ -2021,10 +2095,45 @@ async function callFailureText(action: "发起" | "接听", media: CallMediaKind
     .join(" ");
 }
 
-function notifyIncomingCall(state: Runtime, peer: PeerRuntime, media: CallMediaKind): void {
-  if (state.soundEnabled) {
-    playNotificationSound();
+function startIncomingRingtone(state: Runtime, call: CallRuntime): void {
+  if (call.ringtoneTimerId !== null) {
+    return;
   }
+  const start = () => {
+    if (runtime !== state || state.call !== call || call.status !== "incoming" || call.ringtoneTimerId !== null) {
+      return;
+    }
+    if (!playCallRingtone()) {
+      return;
+    }
+    call.ringtoneTimerId = window.setInterval(() => {
+      if (runtime !== state || state.call !== call || call.status !== "incoming") {
+        stopCallRingtone(call);
+        return;
+      }
+      playCallRingtone();
+    }, CALL_RINGTONE_INTERVAL_MS);
+  };
+  if (notificationAudioContext?.state === "running") {
+    state.soundEnabled = true;
+    start();
+    return;
+  }
+  if (!state.soundEnabled) {
+    return;
+  }
+  void unlockNotificationSound()
+    .then((ready) => {
+      state.soundEnabled = ready;
+      if (ready) {
+        start();
+      }
+    })
+    .catch(() => undefined);
+}
+
+function notifyIncomingCall(state: Runtime, call: CallRuntime, peer: PeerRuntime, media: CallMediaKind): void {
+  startIncomingRingtone(state, call);
   if (!state.notificationsEnabled || notificationPermission() !== "granted" || isWindowActive()) {
     return;
   }
@@ -2093,6 +2202,7 @@ async function startPrivateCall(peer: PeerRuntime, media: CallMediaKind): Promis
     mediaSendFailures: 0,
     mediaFailureNotified: false,
     incomingTimerId: null,
+    ringtoneTimerId: null,
     muted: false,
     cameraOff: false,
     createdAt: Date.now()
@@ -2152,6 +2262,7 @@ async function acceptIncomingCall(): Promise<void> {
     return;
   }
   call.status = "connecting";
+  stopCallRingtone(call);
   if (call.incomingTimerId !== null) {
     window.clearTimeout(call.incomingTimerId);
     call.incomingTimerId = null;
@@ -2239,13 +2350,14 @@ async function handleCallSignal(
       mediaSendFailures: 0,
       mediaFailureNotified: false,
       incomingTimerId: null,
+      ringtoneTimerId: null,
       muted: false,
       cameraOff: false,
       createdAt: payload.createdAt
     };
     state.privatePeerId = peer.clientId;
     scheduleIncomingCallTimeout(state, state.call, peer);
-    notifyIncomingCall(state, peer, payload.media);
+    notifyIncomingCall(state, state.call, peer, payload.media);
     addSystemMessage(`${peer.displayName} 发起${mediaLabel(payload.media)}通话。`);
     renderChat();
     return;
@@ -3538,53 +3650,151 @@ function showInviteDialog(
   mode: "single-link" | "two-channel"
 ): void {
   const backdrop = el("div", { className: "modal-backdrop" });
-  const dialog = el("section", { className: "dialog" });
-  const linkInput = el("textarea", { value: link });
-  const pass = el("input", { type: "text", value: passphrase });
+  const dialog = el("section", { className: "dialog invite-dialog" });
   const notice = el("div", { className: "copy-notice" });
+  const qrCanvas = el("canvas", {
+    className: "invite-qr-canvas",
+    title: "邀请链接二维码",
+    ariaLabel: "邀请链接二维码"
+  });
+  const qrStatus = el("span", { className: "invite-qr-status", text: "正在生成二维码…" });
+  const qrCard = el(
+    "button",
+    {
+      className: "invite-qr-card",
+      title: "点击复制二维码图片",
+      ariaLabel: "复制邀请二维码图片"
+    },
+    [qrCanvas, qrStatus]
+  );
+  qrCard.type = "button";
+  const linkCard = el(
+    "button",
+    {
+      className: "invite-link-card",
+      title: "点击复制邀请链接",
+      ariaLabel: "复制邀请链接"
+    },
+    [
+      el("span", { className: "invite-link-text", text: link }),
+      el("span", { className: "invite-card-hint", text: "点击复制链接" })
+    ]
+  );
+  linkCard.type = "button";
+  const secretCard = el(
+    "button",
+    {
+      className: "invite-secret-card",
+      title: "点击复制安全秘钥",
+      ariaLabel: "复制安全秘钥"
+    },
+    [
+      el("span", { className: "invite-secret-text", text: passphrase }),
+      el("span", { className: "invite-card-hint", text: "点击复制安全秘钥" })
+    ]
+  );
+  secretCard.type = "button";
+  const linkSection = el("div", { className: "invite-copy-section" }, [
+    el("span", { className: "invite-card-label", text: "链接" }),
+    linkCard
+  ]);
+  const secretSection = el("div", { className: "invite-copy-section" }, [
+    el("span", { className: "invite-card-label", text: "安全秘钥" }),
+    secretCard
+  ]);
+  if (mode !== "two-channel") {
+    secretSection.hidden = true;
+  }
   const showCopyNotice = (message: string, isError = false) => {
     notice.textContent = message;
     notice.className = isError ? "copy-notice error" : "copy-notice ok";
   };
-  const close = el("button", { className: "primary", text: "关闭" });
-  const copyLink = el("button", { className: "secondary", text: "复制链接" });
-  copyLink.addEventListener("click", () => {
+  const close = el("button", {
+    className: "dialog-close",
+    text: "×",
+    title: "关闭",
+    ariaLabel: "关闭邀请窗口"
+  });
+  linkCard.addEventListener("click", () => {
     void navigator.clipboard
       ?.writeText(link)
       .then(() => showCopyNotice("链接已复制"))
       .catch(() => showCopyNotice("复制失败，请手动复制", true));
   });
+  secretCard.addEventListener("click", () => {
+    void navigator.clipboard
+      ?.writeText(passphrase)
+      .then(() => showCopyNotice("安全秘钥已复制"))
+      .catch(() => showCopyNotice("复制失败，请手动复制", true));
+  });
+  qrCard.addEventListener("click", () => {
+    void copyCanvasPng(qrCanvas)
+      .then(() => showCopyNotice("二维码图片已复制"))
+      .catch(() => showCopyNotice("当前浏览器不支持复制二维码图片，请复制链接或截图。", true));
+  });
+  void toCanvas(qrCanvas, link, {
+    errorCorrectionLevel: "M",
+    margin: 2,
+    width: INVITE_QR_SIZE,
+    color: {
+      dark: "#17212b",
+      light: "#ffffff"
+    }
+  })
+    .then(() => {
+      qrCanvas.style.width = `${INVITE_QR_SIZE}px`;
+      qrCanvas.style.height = `${INVITE_QR_SIZE}px`;
+      qrStatus.textContent =
+        mode === "two-channel" ? "点击复制二维码；扫码仍需安全秘钥。" : "点击复制二维码；扫码即可加入。";
+    })
+    .catch(() => {
+      qrStatus.textContent = "二维码生成失败，请复制链接分享。";
+      qrCanvas.hidden = true;
+      qrCard.disabled = true;
+    });
+  close.type = "button";
   close.addEventListener("click", () => backdrop.remove());
   dialog.append(
+    close,
     el("h2", { text: "邀请已生成" }),
     el("p", {
       className: "subtle",
       text:
-        mode === "two-channel" ? "请用两个独立渠道分别发送链接和口令。" : "单链接包含全部进入秘密。"
+        mode === "two-channel"
+          ? "可以扫码分享链接，但安全秘钥需要通过另一渠道单独发送。"
+          : "可以扫码或复制链接分享。"
     }),
-    el("label", { className: "field" }, ["链接", linkInput]),
+    el("div", { className: "invite-share-grid" }, [
+      qrCard,
+      el("div", { className: mode === "two-channel" ? "invite-copy-stack" : "invite-copy-stack single" }, [
+        linkSection,
+        secretSection
+      ])
+    ]),
     notice
   );
-  if (mode === "two-channel") {
-    const copyPass = el("button", { className: "secondary", text: "复制口令" });
-    copyPass.addEventListener("click", () => {
-      void navigator.clipboard
-        ?.writeText(passphrase)
-        .then(() => showCopyNotice("口令已复制"))
-        .catch(() => showCopyNotice("复制失败，请手动复制", true));
-    });
+  if (mode !== "two-channel") {
     dialog.append(
-      el("label", { className: "field" }, ["口令", pass]),
-      el("div", { className: "actions" }, [copyLink, copyPass, close])
-    );
-  } else {
-    dialog.append(
-      el("div", { className: "warning", text: "链接被转发即获得进入能力。" }),
-      el("div", { className: "actions" }, [copyLink, close])
+      el("div", { className: "warning", text: "链接被转发即获得进入能力。" })
     );
   }
   backdrop.append(dialog);
   document.body.append(backdrop);
+}
+
+function copyCanvasPng(canvas: HTMLCanvasElement): Promise<void> {
+  if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+    return Promise.reject(new Error("clipboard image unsupported"));
+  }
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) {
+        resolve(blob);
+      } else {
+        reject(new Error("canvas export failed"));
+      }
+    }, "image/png");
+  }).then((blob) => navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]));
 }
 
 function showImageViewer(src: string, alt: string): void {
@@ -3658,6 +3868,7 @@ function showSecurityDetails(): void {
   document.body.append(backdrop);
 }
 
+installNotificationSoundUnlock();
 renderLogin();
 
 window.addEventListener("pagehide", destroyRuntime);
