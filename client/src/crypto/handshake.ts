@@ -17,6 +17,8 @@ export type PairSession = {
   rootKey: Uint8Array;
   sendCK: Uint8Array;
   recvCK: Uint8Array;
+  mediaSendCK: Uint8Array;
+  mediaRecvCK: Uint8Array;
 };
 
 function subtle(): SubtleCrypto {
@@ -80,8 +82,12 @@ export async function derivePairSession(input: {
   const rootKey = await hkdf(pairMaster, "secure-chat/v3/root", transcriptHashBytes, 32);
   const sendLabel = `secure-chat/v3/send-chain/${input.localClientId}->${input.peerClientId}`;
   const recvLabel = `secure-chat/v3/send-chain/${input.peerClientId}->${input.localClientId}`;
+  const mediaSendLabel = `secure-chat/v3/media-send-chain/${input.localClientId}->${input.peerClientId}`;
+  const mediaRecvLabel = `secure-chat/v3/media-send-chain/${input.peerClientId}->${input.localClientId}`;
   const sendCK = await hkdf(pairMaster, utf8(sendLabel), transcriptHashBytes, 32);
   const recvCK = await hkdf(pairMaster, utf8(recvLabel), transcriptHashBytes, 32);
+  const mediaSendCK = await hkdf(pairMaster, utf8(mediaSendLabel), transcriptHashBytes, 32);
+  const mediaRecvCK = await hkdf(pairMaster, utf8(mediaRecvLabel), transcriptHashBytes, 32);
   ecdhSecret.fill(0);
   pairMaster.fill(0);
   return {
@@ -89,6 +95,8 @@ export async function derivePairSession(input: {
     transcriptHash,
     rootKey,
     sendCK,
-    recvCK
+    recvCK,
+    mediaSendCK,
+    mediaRecvCK
   };
 }

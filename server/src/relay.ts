@@ -4,6 +4,8 @@ import type { Duplex } from "node:stream";
 import {
   CLIENT_TIMEOUT_MS,
   MAX_BAD_MESSAGES,
+  MAX_CALL_MEDIA_BYTES_PER_WINDOW,
+  MAX_CALL_MEDIA_MESSAGES_PER_WINDOW,
   MAX_MESSAGES_PER_WINDOW,
   MAX_RELAY_SIZE,
   MAX_ROOM_MEMBERS,
@@ -26,8 +28,12 @@ type ClientState = {
   seenAt: number;
   joinedAt: number;
   rateWindow: number[];
+  mediaRateWindow: number[];
+  byteWindow: Array<{ seenAt: number; bytes: number }>;
   badMessages: number;
 };
+
+const MAX_SOCKET_BUFFER_BYTES = 2 * 1024 * 1024;
 
 export class WebSocketPeer {
   #buffer = Buffer.alloc(0);
@@ -135,6 +141,10 @@ export class WebSocketPeer {
     if (this.#closed || !this.socket.writable) {
       return;
     }
+    if (this.socket.writableLength > MAX_SOCKET_BUFFER_BYTES) {
+      this.terminateLocal();
+      return;
+    }
     let header: Buffer;
     if (payload.length < 126) {
       header = Buffer.from([0x80 | opcode, payload.length]);
@@ -149,7 +159,10 @@ export class WebSocketPeer {
       header[1] = 127;
       header.writeBigUInt64BE(BigInt(payload.length), 2);
     }
-    this.socket.write(Buffer.concat([header, payload]));
+    const ok = this.socket.write(Buffer.concat([header, payload]));
+    if (!ok && this.socket.writableLength > MAX_SOCKET_BUFFER_BYTES) {
+      this.terminateLocal();
+    }
   }
 
   private closeLocal(): void {
@@ -157,6 +170,15 @@ export class WebSocketPeer {
       return;
     }
     this.#closed = true;
+    this.onClose?.();
+  }
+
+  private terminateLocal(): void {
+    if (this.#closed) {
+      return;
+    }
+    this.#closed = true;
+    this.socket.destroy();
     this.onClose?.();
   }
 }
@@ -236,6 +258,8 @@ class Room {
       seenAt: Date.now(),
       joinedAt: Date.now(),
       rateWindow: [],
+      mediaRateWindow: [],
+      byteWindow: [],
       badMessages: 0
     };
     if (join.identityPub) {
@@ -248,20 +272,31 @@ class Room {
 
   private onClientMessage(state: ClientState, parsed: Record<string, unknown> | null): void {
     state.seenAt = Date.now();
-    if (!this.acceptRate(state)) {
+    const relay = validateRelayEnvelope(parsed, this.roomId, state.clientId, (clientId) => this.clients.has(clientId));
+    if (!relay) {
       this.bad(state);
       return;
     }
-    const relay = validateRelayEnvelope(parsed, this.roomId, state.clientId, (clientId) => this.clients.has(clientId));
-    if (!relay) {
+    if (!this.acceptRate(state, relay.kind === "call-media", relay.ct.length)) {
       this.bad(state);
       return;
     }
     this.clients.get(relay.to)?.socket.sendText(JSON.stringify(relay));
   }
 
-  private acceptRate(state: ClientState): boolean {
+  private acceptRate(state: ClientState, mediaBurst = false, bytes = 0): boolean {
     const now = Date.now();
+    if (mediaBurst) {
+      state.mediaRateWindow = state.mediaRateWindow.filter((seen) => now - seen < RATE_WINDOW_MS);
+      state.mediaRateWindow.push(now);
+      state.byteWindow = state.byteWindow.filter((item) => now - item.seenAt < RATE_WINDOW_MS);
+      state.byteWindow.push({ seenAt: now, bytes });
+      const totalBytes = state.byteWindow.reduce((sum, item) => sum + item.bytes, 0);
+      if (totalBytes > MAX_CALL_MEDIA_BYTES_PER_WINDOW) {
+        return false;
+      }
+      return state.mediaRateWindow.length <= MAX_CALL_MEDIA_MESSAGES_PER_WINDOW;
+    }
     state.rateWindow = state.rateWindow.filter((seen) => now - seen < RATE_WINDOW_MS);
     state.rateWindow.push(now);
     return state.rateWindow.length <= MAX_MESSAGES_PER_WINDOW;
@@ -366,8 +401,12 @@ export class RelayHub {
 }
 
 function isValidWebSocketKey(key: string): boolean {
+  if (!/^[A-Za-z0-9+/]{22}==$/u.test(key)) {
+    return false;
+  }
   try {
-    return Buffer.from(key, "base64").length === 16;
+    const decoded = Buffer.from(key, "base64");
+    return decoded.length === 16 && decoded.toString("base64") === key;
   } catch {
     return false;
   }

@@ -5,8 +5,10 @@ import {
   decodeInvite,
   deriveRoomSecrets,
   encodeInvite,
+  readInviteFromLocation,
   unwrapInviteCapsule,
   wrapInviteSecret,
+  type InviteCapsule,
   type InviteSecret
 } from "../../client/src/crypto/room";
 
@@ -24,9 +26,28 @@ const fixtureSecret: InviteSecret = {
 };
 
 describe("room invite", () => {
-  it("encodes single-link invite", () => {
+  it("encodes compact single-link invites and rejects legacy JSON tokens", () => {
+    const invite = createSingleLinkInvite(fixtureSecret);
+    const token = encodeInvite(invite);
+    expect(token.startsWith("s3.")).toBe(true);
+    expect(token.length).toBe(46);
+    const decoded = decodeInvite(token);
+    expect(decoded.mode).toBe("single-link");
+    if (decoded.mode !== "single-link") {
+      throw new Error("expected single-link invite");
+    }
+    expect(decoded.secret.roomSeed).toBe(fixtureSecret.roomSeed);
+    expect(decoded.secret.maxMembers).toBe(16);
+    expect(decoded.secret.features.files).toBe(true);
+
+    const legacyToken = base64urlEncode(new TextEncoder().encode(JSON.stringify(invite)));
+    expect(() => decodeInvite(legacyToken)).toThrow("invalid compact invite");
+  });
+
+  it("reads short invite fragments", () => {
     const token = encodeInvite(createSingleLinkInvite(fixtureSecret));
-    expect(decodeInvite(token).mode).toBe("single-link");
+    expect(readInviteFromLocation({ hash: `#i=${token}` } as Location)).toBe(token);
+    expect(readInviteFromLocation({ hash: `#invite=${token}` } as Location)).toBeNull();
   });
 
   it("derives stable room id and keys", async () => {
@@ -39,15 +60,22 @@ describe("room invite", () => {
 
   it("wraps invite with a separate passphrase", async () => {
     const capsule = await wrapInviteSecret(fixtureSecret, "correct horse battery staple");
+    const token = encodeInvite(capsule);
+    expect(token.startsWith("c3.")).toBe(true);
+    expect(token.length).toBeLessThan(180);
+    const decoded = decodeInvite(token) as InviteCapsule;
     const opened = await unwrapInviteCapsule(capsule, "correct horse battery staple");
+    const openedFromToken = await unwrapInviteCapsule(decoded, "correct horse battery staple");
+    expect(capsule.iterations).toBeGreaterThanOrEqual(1_200_000);
     expect(opened.roomSeed).toBe(fixtureSecret.roomSeed);
+    expect(openedFromToken.roomSeed).toBe(fixtureSecret.roomSeed);
     await expect(unwrapInviteCapsule(capsule, "wrong passphrase")).rejects.toThrow();
   });
 
   it("supports upgraded invite PBKDF2 iterations", async () => {
-    const capsule = await wrapInviteSecret(fixtureSecret, "correct horse battery staple", { iterations: 600_001 });
+    const capsule = await wrapInviteSecret(fixtureSecret, "correct horse battery staple", { iterations: 1_200_001 });
     const opened = await unwrapInviteCapsule(capsule, "correct horse battery staple");
-    expect(capsule.iterations).toBe(600_001);
+    expect(capsule.iterations).toBe(1_200_001);
     expect(opened.roomSeed).toBe(fixtureSecret.roomSeed);
   });
 

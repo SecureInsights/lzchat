@@ -1,6 +1,7 @@
 import "./style.css";
 import emojiDataUrl from "emoji-picker-element-data/zh/emojibase/data.json?url";
 import { APP_NAME, wsUrlForRoom } from "./config";
+import { aesGcmDecrypt, aesGcmEncrypt } from "./crypto/aead";
 import { base64urlDecode, base64urlEncode } from "./crypto/base64url";
 import { peerFingerprint, roomSafetyCode, rosterDigest } from "./crypto/fingerprint";
 import {
@@ -11,7 +12,8 @@ import {
 } from "./crypto/handshake";
 import { randomBytes } from "./crypto/random";
 import { ReceiveRatchet, SendRatchet } from "./crypto/ratchet";
-import { asBufferSource, concatBytes, zeroize } from "./crypto/bytes";
+import { asBufferSource, concatBytes, fromUtf8, utf8, zeroize } from "./crypto/bytes";
+import { hkdf } from "./crypto/kdf";
 import {
   clearLocationFragment,
   createInviteSecret,
@@ -26,6 +28,7 @@ import {
   type ParsedInvite,
   type RoomSecrets
 } from "./crypto/room";
+import { stableJson } from "./crypto/stable-json";
 import { openPayload, sealPayload } from "./protocol/envelope";
 import type {
   CapabilitySet,
@@ -49,9 +52,13 @@ type PeerRuntime = {
   pair: PairSession;
   sendRatchet: SendRatchet;
   recvRatchet: ReceiveRatchet;
+  mediaSendRatchet: SendRatchet;
+  mediaRecvRatchet: ReceiveRatchet;
   fingerprint: string;
   profileSent: boolean;
   messageWindow: number[];
+  mediaMessageWindow: number[];
+  mediaByteWindow: Array<{ seenAt: number; bytes: number }>;
   decryptFailures: number;
   lastFailureNoticeAt: number;
 };
@@ -71,6 +78,200 @@ type ChatMessage = {
   fileBlob?: Blob;
   peerName?: string;
 };
+
+type CallMediaKind = "audio" | "video";
+type CallStatus = "incoming" | "outgoing" | "connecting" | "active";
+type CallDirection = "incoming" | "outgoing";
+type CallSignalPayload = Extract<
+  PlainPayload,
+  { type: "call-offer" | "call-answer" | "call-end" }
+>;
+type CallEndPayload = Extract<PlainPayload, { type: "call-end" }>;
+type CallMediaPayload = Extract<PlainPayload, { type: "call-media" }>;
+type CallControlPayload = CallEndPayload;
+type EncodedChunkType = "key" | "delta";
+
+type EncodedChunkLike = {
+  readonly byteLength: number;
+  readonly type: EncodedChunkType;
+  readonly timestamp: number;
+  readonly duration?: number | null;
+  copyTo(destination: Uint8Array): void;
+};
+
+type VideoFrameLike = CanvasImageSource & {
+  readonly displayWidth?: number;
+  readonly displayHeight?: number;
+  readonly codedWidth?: number;
+  readonly codedHeight?: number;
+  close(): void;
+};
+
+type AudioDataLike = {
+  readonly numberOfChannels: number;
+  readonly numberOfFrames: number;
+  readonly sampleRate: number;
+  copyTo(destination: Float32Array, options: { planeIndex: number; format?: string }): void;
+  close(): void;
+};
+
+type VideoEncoderConfigLike = {
+  codec: string;
+  width: number;
+  height: number;
+  bitrate: number;
+  framerate: number;
+  latencyMode: "realtime";
+  hardwareAcceleration: "no-preference" | "prefer-hardware" | "prefer-software";
+};
+
+type AudioEncoderConfigLike = {
+  codec: string;
+  sampleRate: number;
+  numberOfChannels: number;
+  bitrate: number;
+};
+
+type VideoDecoderConfigLike = {
+  codec: string;
+  codedWidth: number;
+  codedHeight: number;
+};
+
+type AudioDecoderConfigLike = {
+  codec: string;
+  sampleRate: number;
+  numberOfChannels: number;
+};
+
+type VideoEncoderLike = {
+  readonly encodeQueueSize: number;
+  configure(config: VideoEncoderConfigLike): void;
+  encode(frame: VideoFrameLike, options?: { keyFrame?: boolean }): void;
+  close(): void;
+};
+
+type AudioEncoderLike = {
+  readonly encodeQueueSize: number;
+  configure(config: AudioEncoderConfigLike): void;
+  encode(data: AudioDataLike): void;
+  close(): void;
+};
+
+type VideoDecoderLike = {
+  readonly decodeQueueSize: number;
+  configure(config: VideoDecoderConfigLike): void;
+  decode(chunk: EncodedChunkLike): void;
+  close(): void;
+};
+
+type AudioDecoderLike = {
+  readonly decodeQueueSize: number;
+  configure(config: AudioDecoderConfigLike): void;
+  decode(chunk: EncodedChunkLike): void;
+  close(): void;
+};
+
+type VideoEncoderConstructorLike = {
+  new (init: { output: (chunk: EncodedChunkLike) => void; error: (error: Error) => void }): VideoEncoderLike;
+  isConfigSupported?: (config: VideoEncoderConfigLike) => Promise<{ supported: boolean; config?: VideoEncoderConfigLike }>;
+};
+
+type AudioEncoderConstructorLike = {
+  new (init: { output: (chunk: EncodedChunkLike) => void; error: (error: Error) => void }): AudioEncoderLike;
+  isConfigSupported?: (config: AudioEncoderConfigLike) => Promise<{ supported: boolean; config?: AudioEncoderConfigLike }>;
+};
+
+type VideoDecoderConstructorLike = {
+  new (init: { output: (frame: VideoFrameLike) => void; error: (error: Error) => void }): VideoDecoderLike;
+};
+
+type AudioDecoderConstructorLike = {
+  new (init: { output: (data: AudioDataLike) => void; error: (error: Error) => void }): AudioDecoderLike;
+};
+
+type VideoFrameConstructorLike = {
+  new (source: CanvasImageSource, init: { timestamp: number }): VideoFrameLike;
+};
+
+type EncodedVideoChunkConstructorLike = {
+  new (init: { type: EncodedChunkType; timestamp: number; duration?: number; data: Uint8Array }): EncodedChunkLike;
+};
+
+type EncodedAudioChunkConstructorLike = EncodedVideoChunkConstructorLike;
+
+type MediaStreamTrackProcessorConstructorLike = {
+  new (init: { track: MediaStreamTrack }): { readable: ReadableStream<AudioDataLike> };
+};
+
+type CaptureVideoElement = HTMLVideoElement & {
+  requestVideoFrameCallback?: (callback: (now: number, metadata: { mediaTime?: number }) => void) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+};
+
+type WebCodecsRuntime = {
+  VideoEncoder?: VideoEncoderConstructorLike;
+  AudioEncoder?: AudioEncoderConstructorLike;
+  VideoDecoder?: VideoDecoderConstructorLike;
+  AudioDecoder?: AudioDecoderConstructorLike;
+  VideoFrame?: VideoFrameConstructorLike;
+  EncodedVideoChunk?: EncodedVideoChunkConstructorLike;
+  EncodedAudioChunk?: EncodedAudioChunkConstructorLike;
+  MediaStreamTrackProcessor?: MediaStreamTrackProcessorConstructorLike;
+};
+
+type EncodedCallPublisher = {
+  closed: boolean;
+  captureVideo: CaptureVideoElement | null;
+  videoEncoder: VideoEncoderLike | null;
+  audioEncoder: AudioEncoderLike | null;
+  audioReader: ReadableStreamDefaultReader<AudioDataLike> | null;
+  videoCallbackId: number;
+  videoIntervalId: number;
+  videoConfig: VideoEncoderConfigLike | null;
+  audioConfig: AudioEncoderConfigLike | null;
+  videoSeq: number;
+  audioSeq: number;
+  lastKeyFrameAt: number;
+};
+
+type EncodedCallReceiver = {
+  videoDecoder: VideoDecoderLike | null;
+  audioDecoder: AudioDecoderLike | null;
+  audioContext: AudioContext | null;
+  videoConfigKey: string;
+  audioConfigKey: string;
+  gotVideoKeyFrame: boolean;
+  nextAudioTime: number;
+  seenVideoSeq: Set<number>;
+  seenAudioSeq: Set<number>;
+};
+
+type CallRuntime = {
+  callId: string;
+  peerId: string;
+  peerName: string;
+  media: CallMediaKind;
+  direction: CallDirection;
+  status: CallStatus;
+  localStream: MediaStream | null;
+  publisher: EncodedCallPublisher | null;
+  receiver: EncodedCallReceiver;
+  remoteCanvas: HTMLCanvasElement | null;
+  mediaSendFailures: number;
+  mediaFailureNotified: boolean;
+  incomingTimerId: number | null;
+  muted: boolean;
+  cameraOff: boolean;
+  createdAt: number;
+};
+
+type CallMediaGrant = {
+  stream: MediaStream;
+  warning?: string;
+};
+
+type MediaPermissionState = PermissionState | "unsupported";
 
 type Runtime = {
   roomName: string;
@@ -94,6 +295,8 @@ type Runtime = {
   invitePassphrase: string;
   inviteMode: "single-link" | "two-channel";
   incomingFiles: Map<string, IncomingFile>;
+  call: CallRuntime | null;
+  endedCalls: Map<string, number>;
   notificationsEnabled: boolean;
   soundEnabled: boolean;
   lastNotificationAt: number;
@@ -156,6 +359,14 @@ const PEER_MAX_MESSAGES_PER_WINDOW = 120;
 const FAILURE_NOTICE_INTERVAL_MS = 5_000;
 const NOTIFICATION_THROTTLE_MS = 900;
 const MAX_PENDING_RELAYS_PER_PEER = 32;
+const MEDIA_RATCHET_WINDOW = 1024;
+const MEDIA_MAX_SKIPPED_KEYS = 1024;
+const PEER_MAX_CALL_MEDIA_BYTES_PER_WINDOW = 6 * 1024 * 1024;
+const CALL_MAX_VIDEO_CHUNK_BYTES = 128 * 1024;
+const CALL_MAX_AUDIO_CHUNK_BYTES = 16 * 1024;
+const CALL_MAX_MEDIA_SEND_FAILURES = 8;
+const CALL_MAX_AUDIO_QUEUE_DELAY_SEC = 0.8;
+const CALL_INCOMING_TIMEOUT_MS = 60_000;
 const MAX_INLINE_IMAGE_BYTES = 3 * 1024 * 1024;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_FILE_BATCH = 10;
@@ -167,6 +378,45 @@ const MAX_INCOMING_FILES_TOTAL = 12;
 const MAX_INCOMING_RESERVED_BYTES = 100 * 1024 * 1024;
 const MAX_INCOMING_BUFFERED_BYTES = 64 * 1024 * 1024;
 const DISPLAY_IMAGE_MIME_RE = /^image\/(?:png|jpeg|jpg|gif|webp|avif|bmp)$/u;
+const MIME_TYPE_RE = /^[a-z][a-z0-9]*\/[a-z][a-z0-9]*(?:[.+-][a-z0-9]+)*$/u;
+const DANGEROUS_DOWNLOAD_MIME_RE =
+  /^(?:text\/html|text\/javascript|application\/(?:javascript|x-javascript|ecmascript|x-msdownload|x-sh|x-bat|x-csh)|image\/svg\+xml)$/u;
+const PEER_MAX_CALL_MEDIA_MESSAGES_PER_WINDOW = 600;
+const CALL_MEDIA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
+const CALL_VIDEO_WIDTH = 480;
+const CALL_VIDEO_HEIGHT = 270;
+const CALL_VIDEO_FPS = 30;
+const CALL_VIDEO_BITRATE = 700_000;
+const CALL_VIDEO_BITRATES = [CALL_VIDEO_BITRATE, 500_000, 350_000];
+const CALL_VIDEO_HARDWARE_ACCELERATION: VideoEncoderConfigLike["hardwareAcceleration"][] = [
+  "no-preference",
+  "prefer-hardware",
+  "prefer-software"
+];
+const CALL_KEYFRAME_INTERVAL_MS = 2_000;
+const CALL_AUDIO_BITRATE = 48_000;
+const CALL_VIDEO_CODECS = [
+  "vp8",
+  "vp09.00.10.08",
+  "vp09.00.10.08.01.01.01.01.00",
+  "av01.0.04M.08",
+  "av01.0.05M.08",
+  "avc1.42001E",
+  "avc1.42C01E",
+  "avc1.42C01F",
+  "avc1.42E01E",
+  "avc1.4D401E",
+  "avc1.64001E"
+];
+const ENDED_CALL_CACHE_MS = 5 * 60 * 1000;
+const MAX_ENDED_CALL_CACHE = 64;
+const CALL_END_RETRY_DELAYS_MS = [0, 250, 1_000];
+const CALL_STATUS_TEXT: Record<CallStatus, string> = {
+  incoming: "来电",
+  outgoing: "呼叫中",
+  connecting: "连接中",
+  active: "通话中"
+};
 const EMOJI_CATEGORIES: EmojiCategory[] = [
   { group: 0, icon: "😀", label: "表情" },
   { group: 1, icon: "👋", label: "人物" },
@@ -241,6 +491,14 @@ function playNotificationSound(): void {
   oscillator.stop(now + 0.2);
 }
 
+function closeNotificationAudio(): void {
+  const context = notificationAudioContext;
+  notificationAudioContext = null;
+  if (context && context.state !== "closed") {
+    context.close().catch(() => undefined);
+  }
+}
+
 function makePassphrase(): string {
   return (
     base64urlEncode(randomBytes(18))
@@ -310,7 +568,11 @@ function isDisplayImage(file: Blob): boolean {
 }
 
 function mimeOrFallback(value: string): string {
-  return value.trim().slice(0, 120) || "application/octet-stream";
+  const normalized = value.trim().toLowerCase().slice(0, 120);
+  if (!MIME_TYPE_RE.test(normalized) || DANGEROUS_DOWNLOAD_MIME_RE.test(normalized)) {
+    return "application/octet-stream";
+  }
+  return normalized;
 }
 
 function fileNameOrFallback(file: File): string {
@@ -397,16 +659,16 @@ function parseInviteInput(value: string): string {
   try {
     const url = new URL(trimmed);
     const params = new URLSearchParams(url.hash.startsWith("#") ? url.hash.slice(1) : url.hash);
-    const invite = params.get("invite");
+    const invite = params.get("i");
     if (invite) {
       return invite;
     }
   } catch {
     // Not a URL; fall through to token parsing.
   }
-  if (trimmed.includes("invite=")) {
+  if (trimmed.includes("i=")) {
     const params = new URLSearchParams(trimmed.replace(/^#/u, ""));
-    const invite = params.get("invite");
+    const invite = params.get("i");
     if (invite) {
       return invite;
     }
@@ -452,9 +714,13 @@ function markIncomingUnread(state: Runtime, message: ChatMessage, fromClientId: 
 function destroyPeer(peer: PeerRuntime): void {
   peer.sendRatchet.destroy();
   peer.recvRatchet.destroy();
+  peer.mediaSendRatchet.destroy();
+  peer.mediaRecvRatchet.destroy();
   zeroize(peer.pair.rootKey);
   zeroize(peer.pair.sendCK);
   zeroize(peer.pair.recvCK);
+  zeroize(peer.pair.mediaSendCK);
+  zeroize(peer.pair.mediaRecvCK);
 }
 
 function destroyRuntime(): void {
@@ -462,6 +728,9 @@ function destroyRuntime(): void {
   if (!state) {
     return;
   }
+  const activeCall = state.call;
+  state.call = null;
+  cleanupCall(activeCall);
   state.ws.close();
   for (const peer of state.peers.values()) {
     destroyPeer(peer);
@@ -476,6 +745,9 @@ function destroyRuntime(): void {
   for (const key of [...state.incomingFiles.keys()]) {
     deleteIncomingFile(state, key);
   }
+  state.privateUnread.clear();
+  state.endedCalls.clear();
+  closeNotificationAudio();
   for (const message of state.messages) {
     revokeMessageResources(message);
   }
@@ -508,8 +780,32 @@ async function processPendingRelays(): Promise<void> {
   }
 }
 
-function acceptPeerRate(peer: PeerRuntime): boolean {
+function shouldReceiveCallMediaEnvelope(state: Runtime, peer: PeerRuntime, envelope: RelayEnvelope): boolean {
+  const call = state.call;
+  return (
+    envelope.kind !== "call-media" ||
+    Boolean(call && call.status !== "incoming" && call.peerId === peer.clientId)
+  );
+}
+
+function shouldReceiveCallControlEnvelope(state: Runtime, peer: PeerRuntime, envelope: RelayEnvelope): boolean {
+  const call = state.call;
+  return envelope.kind !== "call-control" || Boolean(call && call.peerId === peer.clientId);
+}
+
+function acceptPeerRate(peer: PeerRuntime, envelope: RelayEnvelope): boolean {
   const now = Date.now();
+  if (envelope.kind === "call-media") {
+    peer.mediaMessageWindow = peer.mediaMessageWindow.filter((seen) => now - seen < PEER_MESSAGE_WINDOW_MS);
+    peer.mediaMessageWindow.push(now);
+    peer.mediaByteWindow = peer.mediaByteWindow.filter((item) => now - item.seenAt < PEER_MESSAGE_WINDOW_MS);
+    peer.mediaByteWindow.push({ seenAt: now, bytes: envelope.ct.length });
+    const mediaBytes = peer.mediaByteWindow.reduce((sum, item) => sum + item.bytes, 0);
+    if (mediaBytes > PEER_MAX_CALL_MEDIA_BYTES_PER_WINDOW) {
+      return false;
+    }
+    return peer.mediaMessageWindow.length <= PEER_MAX_CALL_MEDIA_MESSAGES_PER_WINDOW;
+  }
   peer.messageWindow = peer.messageWindow.filter((seen) => now - seen < PEER_MESSAGE_WINDOW_MS);
   peer.messageWindow.push(now);
   return peer.messageWindow.length <= PEER_MAX_MESSAGES_PER_WINDOW;
@@ -531,6 +827,14 @@ function deleteIncomingFile(state: Runtime, key: string): void {
   if (file) {
     zeroizeIncomingFile(file);
     state.incomingFiles.delete(key);
+  }
+}
+
+function deleteIncomingFilesFromPeer(state: Runtime, peerId: string): void {
+  for (const [key, file] of [...state.incomingFiles]) {
+    if (file.from === peerId) {
+      deleteIncomingFile(state, key);
+    }
   }
 }
 
@@ -565,7 +869,7 @@ function setNotice(container: HTMLElement, message: string, isError = false): vo
 }
 
 function inviteUrl(inviteToken: string): string {
-  return `${window.location.origin}${window.location.pathname}#invite=${inviteToken}`;
+  return `${window.location.origin}${window.location.pathname}#i=${inviteToken}`;
 }
 
 function renderLogin(): void {
@@ -818,6 +1122,8 @@ async function startRoom(input: {
     inviteLink: input.inviteLink ?? null,
     invitePassphrase: input.invitePassphrase ?? "",
     inviteMode: input.mode,
+    call: null,
+    endedCalls: new Map(),
     notificationsEnabled: notificationPermission() === "granted",
     soundEnabled: false,
     lastNotificationAt: 0
@@ -853,6 +1159,13 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       state.peers.delete(clientId);
       state.pendingRelays.delete(clientId);
       state.privateUnread.delete(clientId);
+      deleteIncomingFilesFromPeer(state, clientId);
+      if (state.call?.peerId === clientId) {
+        const activeCall = state.call;
+        state.call = null;
+        cleanupCall(activeCall);
+        addSystemMessage(`${peer.displayName} 已离开，通话已结束。`);
+      }
     }
   }
   if (state.privatePeerId && !state.peers.has(state.privatePeerId)) {
@@ -868,6 +1181,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     }
     if (existing && existing.sessionPub !== member.sessionPub) {
       addSystemMessage(`${existing.displayName} 的会话密钥已更新。`);
+      deleteIncomingFilesFromPeer(state, member.clientId);
     }
     if (existing) {
       destroyPeer(existing);
@@ -884,8 +1198,12 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     });
     const sendRatchet = new SendRatchet(pair.sendCK);
     const recvRatchet = new ReceiveRatchet(pair.recvCK);
+    const mediaSendRatchet = new SendRatchet(pair.mediaSendCK);
+    const mediaRecvRatchet = new ReceiveRatchet(pair.mediaRecvCK, MEDIA_RATCHET_WINDOW, MEDIA_MAX_SKIPPED_KEYS);
     zeroize(pair.sendCK);
     zeroize(pair.recvCK);
+    zeroize(pair.mediaSendCK);
+    zeroize(pair.mediaRecvCK);
     state.peers.set(member.clientId, {
       clientId: member.clientId,
       sessionPub: member.sessionPub,
@@ -894,9 +1212,13 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       pair,
       sendRatchet,
       recvRatchet,
+      mediaSendRatchet,
+      mediaRecvRatchet,
       fingerprint: await peerFingerprint(state.room.roomId, member.sessionPub),
       profileSent: false,
       messageWindow: existing?.messageWindow ?? [],
+      mediaMessageWindow: existing?.mediaMessageWindow ?? [],
+      mediaByteWindow: existing?.mediaByteWindow ?? [],
       decryptFailures: 0,
       lastFailureNoticeAt: 0
     });
@@ -957,21 +1279,41 @@ async function handleRelay(envelope: RelayEnvelope, allowQueue = true): Promise<
     }
     return;
   }
-  if (!acceptPeerRate(peer)) {
+  if (!shouldReceiveCallMediaEnvelope(state, peer, envelope)) {
     return;
   }
-  const payload = await openPayload(envelope, peer.pair.transcriptHash, peer.recvRatchet);
+  if (!shouldReceiveCallControlEnvelope(state, peer, envelope)) {
+    return;
+  }
+  if (!acceptPeerRate(peer, envelope)) {
+    return;
+  }
+  if (envelope.kind === "call-control") {
+    const control = await openCallControlEnvelope(envelope, peer);
+    if (control) {
+      await handleCallSignal(state, peer, control);
+    }
+    return;
+  }
+  const payload = await openPayload(
+    envelope,
+    peer.pair.transcriptHash,
+    envelope.kind === "call-media" ? peer.mediaRecvRatchet : peer.recvRatchet
+  );
   if (!payload) {
     peer.decryptFailures += 1;
     const now = Date.now();
-    if (now - peer.lastFailureNoticeAt > FAILURE_NOTICE_INTERVAL_MS) {
+    if (envelope.kind !== "call-media" && now - peer.lastFailureNoticeAt > FAILURE_NOTICE_INTERVAL_MS) {
       addSystemMessage(`${peer.displayName} 有密文未通过验证，已丢弃。`);
       peer.lastFailureNoticeAt = now;
     }
     return;
   }
+  if (envelope.from !== peer.clientId || peer.pair.peerClientId !== envelope.from) {
+    return;
+  }
   if (payload.type === "profile") {
-    peer.displayName = payload.displayName.slice(0, 40) || peer.displayName;
+    peer.displayName = payload.displayName || peer.displayName;
     renderChat();
     return;
   }
@@ -987,6 +1329,18 @@ async function handlePlainPayload(
 ): Promise<void> {
   if (payload.type === "private") {
     await handlePlainPayload(state, envelope, peer, payload.inner, "private");
+    return;
+  }
+  if (
+    payload.type === "call-offer" ||
+    payload.type === "call-answer" ||
+    payload.type === "call-end"
+  ) {
+    await handleCallSignal(state, peer, payload);
+    return;
+  }
+  if (payload.type === "call-media") {
+    handleCallMedia(state, peer, payload);
     return;
   }
   if (payload.type === "text") {
@@ -1251,8 +1605,7 @@ function notifyIncomingMessage(state: Runtime, message: ChatMessage): void {
   const kindText = message.kind === "image" ? "图片消息" : message.kind === "file" ? "文件消息" : "文本消息";
   const notification = new Notification(title, {
     body: `收到一条${scope}${kindText}`,
-    tag: `${state.room.roomId}:${message.scope}`,
-    renotify: false
+    tag: `${state.room.roomId}:${message.scope}`
   });
   notification.addEventListener("click", () => {
     window.focus();
@@ -1293,6 +1646,1192 @@ async function sendPayloadWithContext(
     });
     state.ws.send(envelope);
   }
+}
+
+async function sendCallSignal(state: Runtime, peer: PeerRuntime, payload: CallSignalPayload): Promise<void> {
+  const envelope = await sealPayload({
+    roomId: state.room.roomId,
+    from: state.clientId,
+    to: peer.clientId,
+    kind: "call-signal",
+    transcriptHash: peer.pair.transcriptHash,
+    ratchet: peer.sendRatchet,
+    payload
+  });
+  state.ws.send(envelope);
+}
+
+async function sendCallControlSignal(state: Runtime, peer: PeerRuntime, payload: CallControlPayload): Promise<void> {
+  const seq = nextControlSeq();
+  const aad = utf8(
+    stableJson({
+      v: 3,
+      t: "relay",
+      roomId: state.room.roomId,
+      from: state.clientId,
+      to: peer.clientId,
+      kind: "call-control",
+      seq,
+      transcriptHash: peer.pair.transcriptHash
+    })
+  );
+  const key = await callControlKey(peer);
+  const nonce = randomBytes(12);
+  try {
+    const ct = await aesGcmEncrypt(key, nonce, aad, utf8(stableJson(payload)));
+    state.ws.send({
+      v: 3,
+      t: "relay",
+      roomId: state.room.roomId,
+      from: state.clientId,
+      to: peer.clientId,
+      kind: "call-control",
+      seq,
+      nonce: base64urlEncode(nonce),
+      ct: base64urlEncode(ct)
+    } satisfies RelayEnvelope);
+  } finally {
+    zeroize(key);
+    zeroize(nonce);
+  }
+}
+
+async function openCallControlEnvelope(envelope: RelayEnvelope, peer: PeerRuntime): Promise<CallControlPayload | null> {
+  const aad = utf8(
+    stableJson({
+      v: 3,
+      t: "relay",
+      roomId: envelope.roomId,
+      from: envelope.from,
+      to: envelope.to,
+      kind: envelope.kind,
+      seq: envelope.seq,
+      transcriptHash: peer.pair.transcriptHash
+    })
+  );
+  const key = await callControlKey(peer);
+  let plaintext: Uint8Array | null = null;
+  try {
+    plaintext = await aesGcmDecrypt(key, base64urlDecode(envelope.nonce), aad, base64urlDecode(envelope.ct));
+    const payload = JSON.parse(fromUtf8(plaintext));
+    return isCallControlPayload(payload) ? payload : null;
+  } catch {
+    return null;
+  } finally {
+    if (plaintext) {
+      zeroize(plaintext);
+    }
+    zeroize(key);
+  }
+}
+
+function sendCallEndSignal(
+  state: Runtime,
+  peer: PeerRuntime,
+  callId: string,
+  reason: string
+): void {
+  rememberEndedCall(state, peer.clientId, callId);
+  const payload = (): CallEndPayload => ({
+    type: "call-end",
+    callId,
+    reason,
+    createdAt: Date.now()
+  });
+  for (const delay of CALL_END_RETRY_DELAYS_MS) {
+    window.setTimeout(() => {
+      if (runtime !== state || !state.peers.has(peer.clientId)) {
+        return;
+      }
+      void sendCallControlSignal(state, peer, payload()).catch(() => undefined);
+      void sendCallSignal(state, peer, payload()).catch(() => undefined);
+    }, delay);
+  }
+}
+
+async function sendCallMedia(state: Runtime, peer: PeerRuntime, payload: CallMediaPayload): Promise<void> {
+  if (state.ws.bufferedAmount() > CALL_MEDIA_BUFFER_HIGH_WATER_BYTES) {
+    return;
+  }
+  const envelope = await sealPayload({
+    roomId: state.room.roomId,
+    from: state.clientId,
+    to: peer.clientId,
+    kind: "call-media",
+    transcriptHash: peer.pair.transcriptHash,
+    ratchet: peer.mediaSendRatchet,
+    payload
+  });
+  state.ws.send(envelope);
+}
+
+function webCodecsRuntime(): WebCodecsRuntime {
+  return globalThis as unknown as WebCodecsRuntime;
+}
+
+function createEncodedReceiver(): EncodedCallReceiver {
+  return {
+    videoDecoder: null,
+    audioDecoder: null,
+    audioContext: null,
+    videoConfigKey: "",
+    audioConfigKey: "",
+    gotVideoKeyFrame: false,
+    nextAudioTime: 0,
+    seenVideoSeq: new Set(),
+    seenAudioSeq: new Set()
+  };
+}
+
+async function callControlKey(peer: PeerRuntime): Promise<Uint8Array> {
+  return hkdf(
+    peer.pair.rootKey,
+    "secure-chat/v3/call-control",
+    base64urlDecode(peer.pair.transcriptHash),
+    32
+  );
+}
+
+function nextControlSeq(): number {
+  return Date.now() * 1_000 + Math.floor(Math.random() * 1_000);
+}
+
+function isCallControlPayload(value: unknown): value is CallControlPayload {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const payload = value as Record<string, unknown>;
+  return (
+    payload.type === "call-end" &&
+    typeof payload.callId === "string" &&
+    /^[A-Za-z0-9_-]{1,128}$/u.test(payload.callId) &&
+    (payload.reason === undefined || (typeof payload.reason === "string" && payload.reason.length <= 120)) &&
+    typeof payload.createdAt === "number" &&
+    Number.isSafeInteger(payload.createdAt) &&
+    payload.createdAt > 0
+  );
+}
+
+function cleanupCall(call: CallRuntime | null): void {
+  if (!call) {
+    return;
+  }
+  if (call.incomingTimerId !== null) {
+    window.clearTimeout(call.incomingTimerId);
+    call.incomingTimerId = null;
+  }
+  call.localStream?.getTracks().forEach((track) => track.stop());
+  call.localStream = null;
+  cleanupEncodedPublisher(call.publisher);
+  call.publisher = null;
+  cleanupEncodedReceiver(call.receiver);
+  call.remoteCanvas = null;
+}
+
+function callPeer(state: Runtime, call: CallRuntime): PeerRuntime | null {
+  return state.peers.get(call.peerId) ?? null;
+}
+
+function endedCallKey(peerId: string, callId: string): string {
+  return `${peerId}:${callId}`;
+}
+
+function pruneEndedCalls(state: Runtime): void {
+  const now = Date.now();
+  for (const [key, seenAt] of state.endedCalls) {
+    if (now - seenAt > ENDED_CALL_CACHE_MS) {
+      state.endedCalls.delete(key);
+    }
+  }
+  while (state.endedCalls.size > MAX_ENDED_CALL_CACHE) {
+    const firstKey = state.endedCalls.keys().next().value as string | undefined;
+    if (!firstKey) {
+      return;
+    }
+    state.endedCalls.delete(firstKey);
+  }
+}
+
+function rememberEndedCall(state: Runtime, peerId: string, callId: string): void {
+  pruneEndedCalls(state);
+  state.endedCalls.set(endedCallKey(peerId, callId), Date.now());
+}
+
+function hasEndedCall(state: Runtime, peerId: string, callId: string): boolean {
+  pruneEndedCalls(state);
+  return state.endedCalls.has(endedCallKey(peerId, callId));
+}
+
+function mediaLabel(media: CallMediaKind): string {
+  return media === "video" ? "视频" : "语音";
+}
+
+function callVideoConstraints(): MediaTrackConstraints {
+  return {
+    width: { ideal: CALL_VIDEO_WIDTH },
+    height: { ideal: CALL_VIDEO_HEIGHT },
+    frameRate: { ideal: CALL_VIDEO_FPS, max: CALL_VIDEO_FPS }
+  };
+}
+
+async function queryMediaPermission(name: "microphone" | "camera"): Promise<MediaPermissionState> {
+  const permissions = navigator.permissions;
+  if (!permissions?.query) {
+    return "unsupported";
+  }
+  try {
+    const result = await permissions.query({ name: name as PermissionName });
+    return result.state;
+  } catch {
+    return "unsupported";
+  }
+}
+
+async function describeMediaPermissions(media: CallMediaKind): Promise<string | null> {
+  const microphone = await queryMediaPermission("microphone");
+  const camera = media === "video" ? await queryMediaPermission("camera") : "unsupported";
+  if (microphone === "denied" && media === "audio") {
+    return "麦克风权限已被浏览器拦截，请点击地址栏左侧图标，在站点设置里允许麦克风。";
+  }
+  if (media === "video" && microphone === "denied" && camera === "denied") {
+    return "摄像头和麦克风权限已被浏览器拦截，请点击地址栏左侧图标，在站点设置里允许后刷新。";
+  }
+  if (media === "video" && camera === "denied") {
+    return "摄像头权限已被浏览器拦截，请点击地址栏左侧图标，在站点设置里允许摄像头。";
+  }
+  if (media === "video" && microphone === "denied") {
+    return "麦克风权限已被浏览器拦截，将尝试只发送视频。";
+  }
+  if (microphone === "prompt" || camera === "prompt") {
+    return "浏览器将请求通话权限，请在弹窗中选择允许。";
+  }
+  return null;
+}
+
+async function getCallMedia(media: CallMediaKind): Promise<CallMediaGrant> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("media devices unavailable");
+  }
+  if (media === "audio") {
+    return {
+      stream: await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false
+      })
+    };
+  }
+  try {
+    return {
+      stream: await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: callVideoConstraints()
+      })
+    };
+  } catch (error) {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: callVideoConstraints()
+    });
+    return {
+      stream,
+      warning: `麦克风不可用，已只发送视频。原始原因：${mediaErrorText(error, "video")}`
+    };
+  }
+}
+
+function mediaErrorText(error: unknown, media: CallMediaKind): string {
+  if (typeof error === "object" && error !== null && "name" in error) {
+    const name = String((error as { name?: unknown }).name ?? "");
+    const message = "message" in error ? String((error as { message?: unknown }).message ?? "") : "";
+    if (name === "NotAllowedError") {
+      return media === "audio" ? "浏览器拒绝了麦克风权限" : "浏览器拒绝了摄像头或麦克风权限";
+    }
+    if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+      return media === "audio" ? "未找到可用的麦克风" : "未找到可用的摄像头或麦克风";
+    }
+    if (name === "NotReadableError" || name === "TrackStartError") {
+      return "设备可能被其他应用占用";
+    }
+    if (name === "OverconstrainedError") {
+      return "设备不支持当前采集参数";
+    }
+    if (name === "SecurityError") {
+      return "当前页面不允许访问媒体设备";
+    }
+    if (name === "AbortError") {
+      return "设备启动被中断";
+    }
+    return message || name;
+  }
+  return error instanceof Error ? error.message : "未知错误";
+}
+
+function rawMediaErrorText(error: unknown): string {
+  if (typeof error === "object" && error !== null && "name" in error) {
+    const name = String((error as { name?: unknown }).name ?? "");
+    const message = "message" in error ? String((error as { message?: unknown }).message ?? "") : "";
+    return [name, message].filter(Boolean).join(": ");
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isNotAllowedMediaError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    String((error as { name?: unknown }).name ?? "") === "NotAllowedError"
+  );
+}
+
+function permissionStateText(state: MediaPermissionState): string {
+  if (state === "granted") {
+    return "允许";
+  }
+  if (state === "denied") {
+    return "拒绝";
+  }
+  if (state === "prompt") {
+    return "询问";
+  }
+  return "未知";
+}
+
+async function callFailureText(action: "发起" | "接听", media: CallMediaKind, error: unknown): Promise<string> {
+  const base = `无法${action}${mediaLabel(media)}通话：${mediaErrorText(error, media)}。`;
+  const detail = rawMediaErrorText(error);
+  const microphone = await queryMediaPermission("microphone");
+  const camera = media === "video" ? await queryMediaPermission("camera") : "unsupported";
+  const permissionDetail =
+    media === "video"
+      ? `当前权限：麦克风${permissionStateText(microphone)}，摄像头${permissionStateText(camera)}。`
+      : `当前权限：麦克风${permissionStateText(microphone)}。`;
+  const originHint =
+    window.location.hostname === "127.0.0.1"
+      ? "如果权限已允许但仍失败，请刷新后改用 http://localhost:8088 再试。"
+      : "";
+  const secureHint = window.isSecureContext ? "" : "当前页面不是安全上下文，请改用 localhost 或 HTTPS。";
+  const systemHint =
+    isNotAllowedMediaError(error) && (microphone === "granted" || camera === "granted")
+      ? "站点权限已显示允许但仍被拒绝时，通常是系统隐私权限、浏览器策略或设备沙盒拦截。"
+      : "";
+  const showDebugDetail = window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost";
+  return [base, permissionDetail, secureHint, systemHint, originHint, showDebugDetail && detail ? `浏览器返回：${detail}` : ""]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function notifyIncomingCall(state: Runtime, peer: PeerRuntime, media: CallMediaKind): void {
+  if (state.soundEnabled) {
+    playNotificationSound();
+  }
+  if (!state.notificationsEnabled || notificationPermission() !== "granted" || isWindowActive()) {
+    return;
+  }
+  const notification = new Notification(`${peer.displayName} 发起${mediaLabel(media)}通话`, {
+    body: "打开页面接听或拒绝",
+    tag: `${state.room.roomId}:call:${peer.clientId}`
+  });
+  notification.addEventListener("click", () => {
+    window.focus();
+    notification.close();
+  });
+}
+
+function scheduleIncomingCallTimeout(state: Runtime, call: CallRuntime, peer: PeerRuntime): void {
+  call.incomingTimerId = window.setTimeout(() => {
+    if (runtime !== state || state.call !== call || call.status !== "incoming") {
+      return;
+    }
+    state.call = null;
+    cleanupCall(call);
+    rememberEndedCall(state, peer.clientId, call.callId);
+    addSystemMessage("来电已超时。");
+    renderChat();
+    sendCallEndSignal(state, peer, call.callId, "timeout");
+  }, CALL_INCOMING_TIMEOUT_MS);
+}
+
+function canUseEncodedCall(media: CallMediaKind): boolean {
+  const codecs = webCodecsRuntime();
+  const hasVideo =
+    Boolean(codecs.VideoEncoder) &&
+    Boolean(codecs.VideoDecoder) &&
+    Boolean(codecs.VideoFrame) &&
+    Boolean(codecs.EncodedVideoChunk);
+  const hasAudio =
+    Boolean(codecs.AudioEncoder) &&
+    Boolean(codecs.AudioDecoder) &&
+    Boolean(codecs.EncodedAudioChunk) &&
+    Boolean(codecs.MediaStreamTrackProcessor);
+  if (media === "audio") {
+    return hasAudio;
+  }
+  return hasVideo;
+}
+
+async function startPrivateCall(peer: PeerRuntime, media: CallMediaKind): Promise<void> {
+  const state = runtime;
+  if (!state) {
+    return;
+  }
+  if (state.call) {
+    addSystemMessage("当前已有通话，请先挂断。");
+    return;
+  }
+  const call: CallRuntime = {
+    callId: base64urlEncode(randomBytes(12)),
+    peerId: peer.clientId,
+    peerName: peer.displayName,
+    media,
+    direction: "outgoing",
+    status: "connecting",
+    localStream: null,
+    publisher: null,
+    receiver: createEncodedReceiver(),
+    remoteCanvas: null,
+    mediaSendFailures: 0,
+    mediaFailureNotified: false,
+    incomingTimerId: null,
+    muted: false,
+    cameraOff: false,
+    createdAt: Date.now()
+  };
+  state.call = call;
+  state.privatePeerId = peer.clientId;
+  renderChat();
+  try {
+    const permissionNotice = await describeMediaPermissions(media);
+    if (permissionNotice) {
+      addSystemMessage(permissionNotice);
+    }
+    const mediaGrant = await getCallMedia(media);
+    call.localStream = mediaGrant.stream;
+    if (runtime !== state || state.call !== call) {
+      cleanupCall(call);
+      return;
+    }
+    if (mediaGrant.warning) {
+      addSystemMessage(mediaGrant.warning);
+    }
+    if (!canUseEncodedCall(media)) {
+      throw new Error("当前浏览器不支持 WebCodecs 加密通话");
+    }
+    if (media === "video") {
+      await selectVideoConfig();
+    }
+    await sendCallSignal(state, peer, {
+      type: "call-offer",
+      callId: call.callId,
+      media,
+      mode: "encoded-media",
+      targetIds: [peer.clientId],
+      createdAt: Date.now()
+    });
+    call.status = "outgoing";
+    renderChat();
+  } catch (error) {
+    cleanupCall(call);
+    if (state.call === call) {
+      state.call = null;
+      renderChat();
+    }
+    addSystemMessage(await callFailureText("发起", media, error));
+  }
+}
+
+async function acceptIncomingCall(): Promise<void> {
+  const state = runtime;
+  const call = state?.call;
+  if (!state || !call || call.direction !== "incoming") {
+    return;
+  }
+  const peer = callPeer(state, call);
+  if (!peer) {
+    await finishCall("对方已离线", false);
+    return;
+  }
+  call.status = "connecting";
+  if (call.incomingTimerId !== null) {
+    window.clearTimeout(call.incomingTimerId);
+    call.incomingTimerId = null;
+  }
+  renderChat();
+  try {
+    const permissionNotice = await describeMediaPermissions(call.media);
+    if (permissionNotice) {
+      addSystemMessage(permissionNotice);
+    }
+    const mediaGrant = await getCallMedia(call.media);
+    call.localStream = mediaGrant.stream;
+    if (runtime !== state || state.call !== call) {
+      cleanupCall(call);
+      return;
+    }
+    if (mediaGrant.warning) {
+      addSystemMessage(mediaGrant.warning);
+    }
+    if (!canUseEncodedCall(call.media)) {
+      throw new Error("当前浏览器不支持 WebCodecs 加密通话");
+    }
+    if (call.media === "video") {
+      await selectVideoConfig();
+    }
+    await sendCallSignal(state, peer, {
+      type: "call-answer",
+      callId: call.callId,
+      mode: "encoded-media",
+      createdAt: Date.now()
+    });
+    call.status = "active";
+    await startEncodedPublisher(state, call, peer);
+    renderChat();
+  } catch (error) {
+    await finishCall("无法接听通话", true);
+    addSystemMessage(await callFailureText("接听", call.media, error));
+  }
+}
+
+async function finishCall(reason = "ended", notifyPeer = true): Promise<void> {
+  const state = runtime;
+  const call = state?.call;
+  if (!state || !call) {
+    return;
+  }
+  const peer = callPeer(state, call);
+  if (peer && notifyPeer) {
+    sendCallEndSignal(state, peer, call.callId, reason);
+  } else if (peer) {
+    rememberEndedCall(state, peer.clientId, call.callId);
+  }
+  state.call = null;
+  cleanupCall(call);
+  renderChat();
+}
+
+async function handleCallSignal(
+  state: Runtime,
+  peer: PeerRuntime,
+  payload: CallSignalPayload
+): Promise<void> {
+  if (payload.type === "call-offer") {
+    if (hasEndedCall(state, peer.clientId, payload.callId)) {
+      return;
+    }
+    if (state.call && state.call.callId !== payload.callId) {
+      sendCallEndSignal(state, peer, payload.callId, "busy");
+      return;
+    }
+    if (payload.targetIds && payload.targetIds.length > 0 && !payload.targetIds.includes(state.clientId)) {
+      return;
+    }
+    state.call = {
+      callId: payload.callId,
+      peerId: peer.clientId,
+      peerName: peer.displayName,
+      media: payload.media,
+      direction: "incoming",
+      status: "incoming",
+      localStream: null,
+      publisher: null,
+      receiver: createEncodedReceiver(),
+      remoteCanvas: null,
+      mediaSendFailures: 0,
+      mediaFailureNotified: false,
+      incomingTimerId: null,
+      muted: false,
+      cameraOff: false,
+      createdAt: payload.createdAt
+    };
+    state.privatePeerId = peer.clientId;
+    scheduleIncomingCallTimeout(state, state.call, peer);
+    notifyIncomingCall(state, peer, payload.media);
+    addSystemMessage(`${peer.displayName} 发起${mediaLabel(payload.media)}通话。`);
+    renderChat();
+    return;
+  }
+  const call = state.call;
+  if (payload.type === "call-end") {
+    rememberEndedCall(state, peer.clientId, payload.callId);
+    if (!call || call.callId !== payload.callId || call.peerId !== peer.clientId) {
+      return;
+    }
+    const message =
+      payload.reason === "busy"
+        ? `${peer.displayName} 正在通话中。`
+        : payload.reason === "rejected"
+          ? `${peer.displayName} 已拒绝通话。`
+          : payload.reason === "timeout"
+            ? "通话未接听，已超时。"
+            : "通话已结束。";
+    cleanupCall(call);
+    state.call = null;
+    addSystemMessage(message);
+    renderChat();
+    return;
+  }
+  if (!call || call.callId !== payload.callId || call.peerId !== peer.clientId) {
+    return;
+  }
+  if (payload.type === "call-answer") {
+    if (call.direction === "outgoing") {
+      try {
+        call.status = "active";
+        await startEncodedPublisher(state, call, peer);
+        renderChat();
+      } catch {
+        cleanupCall(call);
+        state.call = null;
+        renderChat();
+        addSystemMessage("通话媒体启动失败，已结束通话。");
+        sendCallEndSignal(state, peer, call.callId, "media-failed");
+      }
+    }
+    return;
+  }
+}
+
+async function selectVideoConfig(): Promise<VideoEncoderConfigLike> {
+  const codecs = webCodecsRuntime();
+  const encoder = codecs.VideoEncoder;
+  if (!encoder) {
+    throw new Error("VideoEncoder unavailable");
+  }
+  for (const codec of CALL_VIDEO_CODECS) {
+    for (const hardwareAcceleration of CALL_VIDEO_HARDWARE_ACCELERATION) {
+      for (const bitrate of CALL_VIDEO_BITRATES) {
+        const config: VideoEncoderConfigLike = {
+          codec,
+          width: CALL_VIDEO_WIDTH,
+          height: CALL_VIDEO_HEIGHT,
+          bitrate,
+          framerate: CALL_VIDEO_FPS,
+          latencyMode: "realtime",
+          hardwareAcceleration
+        };
+        if (!encoder.isConfigSupported) {
+          return config;
+        }
+        try {
+          const support = await encoder.isConfigSupported(config);
+          if (support.supported) {
+            return { ...config, ...(support.config ?? {}) };
+          }
+        } catch {
+          // Try the next encoder profile.
+        }
+      }
+    }
+  }
+  throw new Error("No supported video encoder");
+}
+
+async function startEncodedPublisher(state: Runtime, call: CallRuntime, peer: PeerRuntime): Promise<void> {
+  if (call.publisher || !call.localStream) {
+    return;
+  }
+  const publisher: EncodedCallPublisher = {
+    closed: false,
+    captureVideo: null,
+    videoEncoder: null,
+    audioEncoder: null,
+    audioReader: null,
+    videoCallbackId: 0,
+    videoIntervalId: 0,
+    videoConfig: null,
+    audioConfig: null,
+    videoSeq: 0,
+    audioSeq: 0,
+    lastKeyFrameAt: 0
+  };
+  call.publisher = publisher;
+  let startedTrack = false;
+  if (call.media === "video") {
+    await startEncodedVideo(state, call, peer, publisher);
+    startedTrack = true;
+  }
+  const startedAudio = await startEncodedAudio(state, call, peer, publisher);
+  startedTrack = startedTrack || startedAudio;
+  if (!startedTrack) {
+    cleanupEncodedPublisher(publisher);
+    call.publisher = null;
+    throw new Error("No supported media encoder");
+  }
+}
+
+async function startEncodedVideo(
+  state: Runtime,
+  call: CallRuntime,
+  peer: PeerRuntime,
+  publisher: EncodedCallPublisher
+): Promise<void> {
+  const codecs = webCodecsRuntime();
+  if (!call.localStream || !codecs.VideoEncoder || !codecs.VideoFrame) {
+    throw new Error("VideoEncoder unavailable");
+  }
+  const video = document.createElement("video") as CaptureVideoElement;
+  video.srcObject = call.localStream;
+  video.muted = true;
+  video.playsInline = true;
+  await video.play();
+  publisher.captureVideo = video;
+  publisher.videoConfig = await selectVideoConfig();
+  publisher.videoEncoder = new codecs.VideoEncoder({
+    output: (chunk) => {
+      void sendEncodedVideoChunk(state, call, peer, publisher, chunk);
+    },
+    error: () => {
+      if (runtime === state && state.call === call) {
+        addSystemMessage("视频编码器异常，已停止发送视频。");
+      }
+    }
+  });
+  publisher.videoEncoder.configure(publisher.videoConfig);
+  const encodeFrame = (now: number, metadata: { mediaTime?: number } | null) => {
+    if (publisher.closed || runtime !== state || state.call !== call || !publisher.videoEncoder) {
+      return;
+    }
+    if (publisher.videoEncoder.encodeQueueSize < 3 && video.readyState >= 2) {
+      const timestamp = Math.round(
+        metadata && Number.isFinite(metadata.mediaTime)
+          ? (metadata.mediaTime ?? 0) * 1_000_000
+          : performance.now() * 1_000
+      );
+      try {
+        const FrameCtor = codecs.VideoFrame;
+        if (!FrameCtor) {
+          return;
+        }
+        const frame = new FrameCtor(video, { timestamp });
+        const keyFrame =
+          publisher.lastKeyFrameAt === 0 || now - publisher.lastKeyFrameAt >= CALL_KEYFRAME_INTERVAL_MS;
+        publisher.videoEncoder.encode(frame, { keyFrame });
+        frame.close();
+        if (keyFrame) {
+          publisher.lastKeyFrameAt = now;
+        }
+      } catch {
+        // Skip a bad frame without surfacing noisy decoder details.
+      }
+    }
+    if (video.requestVideoFrameCallback) {
+      publisher.videoCallbackId = video.requestVideoFrameCallback(encodeFrame);
+    }
+  };
+  if (video.requestVideoFrameCallback) {
+    publisher.videoCallbackId = video.requestVideoFrameCallback(encodeFrame);
+  } else {
+    publisher.videoIntervalId = window.setInterval(() => {
+      encodeFrame(performance.now(), null);
+    }, Math.max(16, Math.round(1000 / CALL_VIDEO_FPS)));
+  }
+}
+
+async function sendEncodedVideoChunk(
+  state: Runtime,
+  call: CallRuntime,
+  peer: PeerRuntime,
+  publisher: EncodedCallPublisher,
+  chunk: EncodedChunkLike
+): Promise<void> {
+  if (publisher.closed || runtime !== state || state.call !== call || !publisher.videoConfig) {
+    return;
+  }
+  const bytes = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(bytes);
+  try {
+    if (bytes.byteLength > CALL_MAX_VIDEO_CHUNK_BYTES) {
+      return;
+    }
+    await sendCallMedia(state, peer, {
+      type: "call-media",
+      callId: call.callId,
+      media: "video",
+      seq: publisher.videoSeq,
+      codec: publisher.videoConfig.codec,
+      chunkType: chunk.type,
+      timestamp: chunk.timestamp,
+      duration: Number(chunk.duration ?? 0),
+      width: CALL_VIDEO_WIDTH,
+      height: CALL_VIDEO_HEIGHT,
+      bytes: base64urlEncode(bytes),
+      createdAt: Date.now()
+    });
+    call.mediaSendFailures = 0;
+  } catch {
+    handleMediaSendFailure(call);
+  } finally {
+    zeroize(bytes);
+  }
+  publisher.videoSeq += 1;
+}
+
+async function startEncodedAudio(
+  state: Runtime,
+  call: CallRuntime,
+  peer: PeerRuntime,
+  publisher: EncodedCallPublisher
+): Promise<boolean> {
+  const codecs = webCodecsRuntime();
+  if (
+    !call.localStream ||
+    !codecs.AudioEncoder ||
+    !codecs.MediaStreamTrackProcessor ||
+    !codecs.EncodedAudioChunk
+  ) {
+    return false;
+  }
+  const track = call.localStream.getAudioTracks()[0];
+  if (!track) {
+    return false;
+  }
+  const settings = track.getSettings();
+  const config: AudioEncoderConfigLike = {
+    codec: "opus",
+    sampleRate: typeof settings.sampleRate === "number" ? settings.sampleRate : 48_000,
+    numberOfChannels: typeof settings.channelCount === "number" ? Math.max(1, Math.min(2, settings.channelCount)) : 1,
+    bitrate: CALL_AUDIO_BITRATE
+  };
+  try {
+    const support = codecs.AudioEncoder.isConfigSupported
+      ? await codecs.AudioEncoder.isConfigSupported(config)
+      : { supported: true, config };
+    if (!support.supported) {
+      return false;
+    }
+    publisher.audioConfig = support.config ?? config;
+    publisher.audioEncoder = new codecs.AudioEncoder({
+      output: (chunk) => {
+        void sendEncodedAudioChunk(state, call, peer, publisher, chunk);
+      },
+      error: () => undefined
+    });
+    publisher.audioEncoder.configure(publisher.audioConfig);
+    const processor = new codecs.MediaStreamTrackProcessor({ track });
+    publisher.audioReader = processor.readable.getReader();
+    void readEncodedAudioFrames(publisher);
+    return true;
+  } catch {
+    publisher.audioEncoder = null;
+    publisher.audioReader = null;
+    return false;
+  }
+}
+
+async function readEncodedAudioFrames(publisher: EncodedCallPublisher): Promise<void> {
+  while (!publisher.closed && publisher.audioReader && publisher.audioEncoder) {
+    const next = await publisher.audioReader.read().catch(() => null);
+    if (!next || next.done) {
+      break;
+    }
+    const audioData = next.value;
+    if (publisher.audioEncoder.encodeQueueSize < 8) {
+      publisher.audioEncoder.encode(audioData);
+    }
+    audioData.close();
+  }
+}
+
+async function sendEncodedAudioChunk(
+  state: Runtime,
+  call: CallRuntime,
+  peer: PeerRuntime,
+  publisher: EncodedCallPublisher,
+  chunk: EncodedChunkLike
+): Promise<void> {
+  if (publisher.closed || runtime !== state || state.call !== call || !publisher.audioConfig) {
+    return;
+  }
+  const bytes = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(bytes);
+  try {
+    if (bytes.byteLength > CALL_MAX_AUDIO_CHUNK_BYTES) {
+      return;
+    }
+    await sendCallMedia(state, peer, {
+      type: "call-media",
+      callId: call.callId,
+      media: "audio",
+      seq: publisher.audioSeq,
+      codec: publisher.audioConfig.codec,
+      chunkType: chunk.type,
+      timestamp: chunk.timestamp,
+      duration: Number(chunk.duration ?? 0),
+      sampleRate: publisher.audioConfig.sampleRate,
+      numberOfChannels: publisher.audioConfig.numberOfChannels,
+      bytes: base64urlEncode(bytes),
+      createdAt: Date.now()
+    });
+    call.mediaSendFailures = 0;
+  } catch {
+    handleMediaSendFailure(call);
+  } finally {
+    zeroize(bytes);
+  }
+  publisher.audioSeq += 1;
+}
+
+function handleMediaSendFailure(call: CallRuntime): void {
+  call.mediaSendFailures += 1;
+  if (call.mediaFailureNotified || call.mediaSendFailures < CALL_MAX_MEDIA_SEND_FAILURES) {
+    return;
+  }
+  call.mediaFailureNotified = true;
+  addSystemMessage("媒体发送连续失败，通话已自动结束。");
+  void finishCall("media-send-failed", true);
+}
+
+function cleanupEncodedPublisher(publisher: EncodedCallPublisher | null): void {
+  if (!publisher) {
+    return;
+  }
+  publisher.closed = true;
+  if (publisher.captureVideo?.cancelVideoFrameCallback && publisher.videoCallbackId) {
+    publisher.captureVideo.cancelVideoFrameCallback(publisher.videoCallbackId);
+  }
+  if (publisher.videoIntervalId) {
+    window.clearInterval(publisher.videoIntervalId);
+  }
+  publisher.audioReader?.cancel().catch(() => undefined);
+  try {
+    publisher.videoEncoder?.close();
+  } catch {
+    // Already closed.
+  }
+  try {
+    publisher.audioEncoder?.close();
+  } catch {
+    // Already closed.
+  }
+  if (publisher.captureVideo) {
+    publisher.captureVideo.srcObject = null;
+  }
+  publisher.captureVideo = null;
+  publisher.videoEncoder = null;
+  publisher.audioEncoder = null;
+  publisher.audioReader = null;
+}
+
+function cleanupEncodedReceiver(receiver: EncodedCallReceiver): void {
+  try {
+    receiver.videoDecoder?.close();
+  } catch {
+    // Already closed.
+  }
+  try {
+    receiver.audioDecoder?.close();
+  } catch {
+    // Already closed.
+  }
+  receiver.audioContext?.close().catch(() => undefined);
+  receiver.videoDecoder = null;
+  receiver.audioDecoder = null;
+  receiver.audioContext = null;
+  receiver.seenVideoSeq.clear();
+  receiver.seenAudioSeq.clear();
+}
+
+function trimSeenMediaSeq(seen: Set<number>, seq: number): boolean {
+  if (seen.has(seq)) {
+    return false;
+  }
+  seen.add(seq);
+  if (seen.size > 256) {
+    const minRetained = seq - 256;
+    for (const item of [...seen]) {
+      if (item < minRetained) {
+        seen.delete(item);
+      }
+    }
+  }
+  return true;
+}
+
+function handleCallMedia(state: Runtime, peer: PeerRuntime, payload: CallMediaPayload): void {
+  const call = state.call;
+  if (!call || call.callId !== payload.callId || call.peerId !== peer.clientId || call.status === "incoming") {
+    return;
+  }
+  if (payload.media === "video") {
+    if (call.media !== "video" || !trimSeenMediaSeq(call.receiver.seenVideoSeq, payload.seq)) {
+      return;
+    }
+    decodeCallVideo(state, call, payload);
+    return;
+  }
+  if (!trimSeenMediaSeq(call.receiver.seenAudioSeq, payload.seq)) {
+    return;
+  }
+  decodeCallAudio(call, payload);
+}
+
+function decodeCallVideo(state: Runtime, call: CallRuntime, payload: CallMediaPayload): void {
+  const codecs = webCodecsRuntime();
+  if (!codecs.VideoDecoder || !codecs.EncodedVideoChunk || !payload.width || !payload.height) {
+    return;
+  }
+  const receiver = call.receiver;
+  const configKey = `${payload.codec}:${payload.width}:${payload.height}`;
+  try {
+    if (!receiver.videoDecoder || receiver.videoConfigKey !== configKey) {
+      receiver.videoDecoder?.close();
+      receiver.videoDecoder = new codecs.VideoDecoder({
+        output: (frame) => {
+          try {
+            drawDecodedVideoFrame(call, frame);
+          } catch {
+            frame.close();
+          }
+        },
+        error: () => {
+          if (runtime === state && state.call === call) {
+            receiver.gotVideoKeyFrame = false;
+          }
+        }
+      });
+      receiver.videoDecoder.configure({
+        codec: payload.codec,
+        codedWidth: payload.width,
+        codedHeight: payload.height
+      });
+      receiver.videoConfigKey = configKey;
+      receiver.gotVideoKeyFrame = false;
+    }
+  } catch {
+    receiver.videoDecoder?.close();
+    receiver.videoDecoder = null;
+    receiver.videoConfigKey = "";
+    receiver.gotVideoKeyFrame = false;
+    return;
+  }
+  if (!receiver.gotVideoKeyFrame && payload.chunkType !== "key") {
+    return;
+  }
+  if (receiver.videoDecoder.decodeQueueSize > 8) {
+    return;
+  }
+  const hadVideoKeyFrame = receiver.gotVideoKeyFrame;
+  const data = base64urlDecode(payload.bytes);
+  const chunk = new codecs.EncodedVideoChunk({
+    type: payload.chunkType,
+    timestamp: payload.timestamp,
+    duration: payload.duration,
+    data
+  });
+  zeroize(data);
+  try {
+    receiver.videoDecoder.decode(chunk);
+  } catch {
+    receiver.gotVideoKeyFrame = false;
+    return;
+  }
+  if (payload.chunkType === "key") {
+    receiver.gotVideoKeyFrame = true;
+    if (!hadVideoKeyFrame) {
+      renderChat();
+    }
+  }
+}
+
+function drawDecodedVideoFrame(call: CallRuntime, frame: VideoFrameLike): void {
+  const canvas = call.remoteCanvas;
+  if (!canvas) {
+    frame.close();
+    return;
+  }
+  const width = frame.displayWidth ?? frame.codedWidth ?? CALL_VIDEO_WIDTH;
+  const height = frame.displayHeight ?? frame.codedHeight ?? CALL_VIDEO_HEIGHT;
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  const context = canvas.getContext("2d", { alpha: false });
+  context?.drawImage(frame, 0, 0, canvas.width, canvas.height);
+  frame.close();
+}
+
+function decodeCallAudio(call: CallRuntime, payload: CallMediaPayload): void {
+  const codecs = webCodecsRuntime();
+  if (!codecs.AudioDecoder || !codecs.EncodedAudioChunk || !payload.sampleRate || !payload.numberOfChannels) {
+    return;
+  }
+  const receiver = call.receiver;
+  const configKey = `${payload.codec}:${payload.sampleRate}:${payload.numberOfChannels}`;
+  try {
+    if (!receiver.audioDecoder || receiver.audioConfigKey !== configKey) {
+      receiver.audioDecoder?.close();
+      receiver.audioDecoder = new codecs.AudioDecoder({
+        output: (audioData) => {
+          try {
+            playDecodedAudio(receiver, audioData);
+          } catch {
+            audioData.close();
+          }
+        },
+        error: () => undefined
+      });
+      receiver.audioDecoder.configure({
+        codec: payload.codec,
+        sampleRate: payload.sampleRate,
+        numberOfChannels: payload.numberOfChannels
+      });
+      receiver.audioConfigKey = configKey;
+    }
+  } catch {
+    receiver.audioDecoder?.close();
+    receiver.audioDecoder = null;
+    receiver.audioConfigKey = "";
+    return;
+  }
+  if (receiver.audioDecoder.decodeQueueSize > 20) {
+    return;
+  }
+  const data = base64urlDecode(payload.bytes);
+  const chunk = new codecs.EncodedAudioChunk({
+    type: payload.chunkType,
+    timestamp: payload.timestamp,
+    duration: payload.duration,
+    data
+  });
+  zeroize(data);
+  try {
+    receiver.audioDecoder.decode(chunk);
+  } catch {
+    // Drop malformed audio chunks without breaking the call UI.
+  }
+}
+
+function playDecodedAudio(receiver: EncodedCallReceiver, audioData: AudioDataLike): void {
+  const AudioContextCtor = window.AudioContext;
+  if (!AudioContextCtor) {
+    audioData.close();
+    return;
+  }
+  receiver.audioContext ??= new AudioContextCtor();
+  if (receiver.audioContext.state === "suspended") {
+    receiver.audioContext.resume().catch(() => undefined);
+  }
+  const context = receiver.audioContext;
+  const channels = Math.max(1, Math.min(audioData.numberOfChannels, 2));
+  const buffer = context.createBuffer(channels, audioData.numberOfFrames, audioData.sampleRate);
+  for (let channel = 0; channel < channels; channel += 1) {
+    const target = new Float32Array(audioData.numberOfFrames);
+    audioData.copyTo(target, { planeIndex: channel, format: "f32-planar" });
+    buffer.copyToChannel(target, channel);
+  }
+  const source = context.createBufferSource();
+  source.buffer = buffer;
+  source.connect(context.destination);
+  source.addEventListener("ended", () => {
+    source.disconnect();
+  }, { once: true });
+  if (receiver.nextAudioTime - context.currentTime > CALL_MAX_AUDIO_QUEUE_DELAY_SEC) {
+    receiver.nextAudioTime = context.currentTime + 0.05;
+  }
+  const startAt = Math.max(context.currentTime + 0.02, receiver.nextAudioTime || 0);
+  source.start(startAt);
+  receiver.nextAudioTime = startAt + buffer.duration;
+  audioData.close();
 }
 
 async function sendTextMessage(text: string): Promise<void> {
@@ -1579,6 +3118,31 @@ function renderTopbar(state: Runtime, privatePeer: PeerRuntime | null): HTMLElem
     void enableRoomNotifications();
   });
   actions.push(notifications);
+  if (privatePeer) {
+    const audioCall = el("button", {
+      className: "secondary call-action",
+      text: "语音",
+      title: `语音通话 ${privatePeer.displayName}`,
+      ariaLabel: `语音通话 ${privatePeer.displayName}`,
+      disabled: Boolean(state.call)
+    });
+    audioCall.type = "button";
+    audioCall.addEventListener("click", () => {
+      void startPrivateCall(privatePeer, "audio");
+    });
+    const videoCall = el("button", {
+      className: "secondary call-action",
+      text: "视频",
+      title: `视频通话 ${privatePeer.displayName}`,
+      ariaLabel: `视频通话 ${privatePeer.displayName}`,
+      disabled: Boolean(state.call)
+    });
+    videoCall.type = "button";
+    videoCall.addEventListener("click", () => {
+      void startPrivateCall(privatePeer, "video");
+    });
+    actions.push(audioCall, videoCall);
+  }
   if (state.inviteLink) {
     const invite = el("button", { className: "secondary", text: "邀请" });
     invite.addEventListener("click", () =>
@@ -1857,6 +3421,97 @@ function renderComposer(): HTMLElement {
   return composer;
 }
 
+function renderMediaElement(stream: MediaStream, className: string, muted: boolean): HTMLVideoElement | HTMLAudioElement {
+  const hasVideo = stream.getVideoTracks().length > 0;
+  const media = el(hasVideo ? "video" : "audio", { className });
+  media.autoplay = true;
+  media.setAttribute("playsinline", "true");
+  media.muted = muted;
+  media.srcObject = stream;
+  return media;
+}
+
+function renderCallLayer(state: Runtime): HTMLElement | null {
+  const call = state.call;
+  if (!call) {
+    return null;
+  }
+  const isIncoming = call.status === "incoming";
+  const panel = el("section", { className: ["call-panel", call.media].join(" ") });
+  const title = `${call.peerName} · ${mediaLabel(call.media)}${CALL_STATUS_TEXT[call.status]}`;
+  const status = el("div", { className: "call-status" }, [
+    el("div", { className: "call-avatar", text: avatarText(call.peerName) }),
+    el("div", { className: "call-text" }, [
+      el("div", { className: "call-title", text: title }),
+      el("div", {
+        className: "call-subtitle",
+        text: call.media === "video" ? "端到端加密媒体流 · 480x270 · 30fps" : "端到端加密语音流"
+      })
+    ])
+  ]);
+  const mediaStage = el("div", { className: "call-stage" });
+  if (call.media === "video") {
+    const canvas = el("canvas", { className: "call-remote-media call-remote-canvas" }) as HTMLCanvasElement;
+    canvas.width = CALL_VIDEO_WIDTH;
+    canvas.height = CALL_VIDEO_HEIGHT;
+    call.remoteCanvas = canvas;
+    mediaStage.append(canvas);
+    if (!call.receiver.gotVideoKeyFrame) {
+      mediaStage.append(el("div", { className: "call-waiting", text: CALL_STATUS_TEXT[call.status] }));
+    }
+  } else {
+    mediaStage.append(el("div", { className: "call-waiting", text: CALL_STATUS_TEXT[call.status] }));
+  }
+  if (call.localStream && call.localStream.getTracks().length > 0) {
+    mediaStage.append(renderMediaElement(call.localStream, "call-local-media", true));
+  }
+  const actions = el("div", { className: "call-controls" });
+  if (isIncoming) {
+    const accept = el("button", { className: "call-control accept", text: "接听" });
+    accept.type = "button";
+    accept.addEventListener("click", () => {
+      void acceptIncomingCall();
+    });
+    const reject = el("button", { className: "call-control end", text: "拒绝" });
+    reject.type = "button";
+    reject.addEventListener("click", () => {
+      void finishCall("rejected", true);
+    });
+    actions.append(accept, reject);
+  } else {
+    const mute = el("button", { className: "call-control", text: call.muted ? "开麦" : "静音" });
+    mute.type = "button";
+    mute.addEventListener("click", () => {
+      call.muted = !call.muted;
+      call.localStream?.getAudioTracks().forEach((track) => {
+        track.enabled = !call.muted;
+      });
+      renderChat();
+    });
+    actions.append(mute);
+    if (call.media === "video") {
+      const camera = el("button", { className: "call-control", text: call.cameraOff ? "开镜头" : "关镜头" });
+      camera.type = "button";
+      camera.addEventListener("click", () => {
+        call.cameraOff = !call.cameraOff;
+        call.localStream?.getVideoTracks().forEach((track) => {
+          track.enabled = !call.cameraOff;
+        });
+        renderChat();
+      });
+      actions.append(camera);
+    }
+    const hangup = el("button", { className: "call-control end", text: "挂断" });
+    hangup.type = "button";
+    hangup.addEventListener("click", () => {
+      void finishCall("ended", true);
+    });
+    actions.append(hangup);
+  }
+  panel.append(status, mediaStage, actions);
+  return panel;
+}
+
 function renderChat(): void {
   const state = runtime;
   if (!state) {
@@ -1869,6 +3524,10 @@ function renderChat(): void {
   const messages = renderMessageList(state);
   main.append(renderTopbar(state, privatePeer), renderModeBanner(privatePeer), messages, renderComposer());
   layout.append(renderSidebar(state), main);
+  const callLayer = renderCallLayer(state);
+  if (callLayer) {
+    layout.append(callLayer);
+  }
   setApp(layout);
   messages.scrollTop = messages.scrollHeight;
 }

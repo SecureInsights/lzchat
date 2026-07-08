@@ -22,7 +22,8 @@ function isHttpsRequest(req: IncomingMessage): boolean {
 }
 
 export function sendJson(req: IncomingMessage, res: ServerResponse, status: number, body: unknown): void {
-  applySecurityHeaders(res, { upgradeInsecureRequests: isHttpsRequest(req) });
+  const isHttps = isHttpsRequest(req);
+  applySecurityHeaders(res, { allowInsecureWebSocket: !isHttps, upgradeInsecureRequests: isHttps });
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
 }
@@ -72,7 +73,8 @@ export async function serveHttp(req: IncomingMessage, res: ServerResponse, distD
     filePath = indexPath;
   }
   try {
-    applySecurityHeaders(res, { upgradeInsecureRequests: isHttpsRequest(req) });
+    const isHttps = isHttpsRequest(req);
+    applySecurityHeaders(res, { allowInsecureWebSocket: !isHttps, upgradeInsecureRequests: isHttps });
     const ext = path.extname(filePath);
     res.writeHead(200, { "content-type": MIME_TYPES[ext] ?? "application/octet-stream" });
     createReadStream(filePath).pipe(res);

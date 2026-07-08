@@ -34,6 +34,9 @@ export function zeroize(value: Uint8Array): void {
 }
 
 export function asBufferSource(value: Uint8Array): Uint8Array<ArrayBuffer> {
+  if (value.buffer instanceof ArrayBuffer && value.byteOffset === 0 && value.byteLength === value.buffer.byteLength) {
+    return value as Uint8Array<ArrayBuffer>;
+  }
   const out = new Uint8Array(value.byteLength);
   out.set(value);
   return out;

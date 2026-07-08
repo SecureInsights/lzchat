@@ -23,18 +23,30 @@ export async function deriveNonce(messageKey: Uint8Array, kind: string, seq: num
 export class SendRatchet {
   #chainKey: Uint8Array;
   #seq = 0;
+  #pending = Promise.resolve();
 
   constructor(chainKey: Uint8Array) {
     this.#chainKey = new Uint8Array(chainKey);
   }
 
   async next(): Promise<{ seq: number; messageKey: Uint8Array }> {
-    this.#seq += 1;
-    const messageKey = await deriveMessageKey(this.#chainKey, this.#seq);
-    const nextChainKey = await deriveNextChainKey(this.#chainKey, this.#seq);
-    zeroize(this.#chainKey);
-    this.#chainKey = nextChainKey;
-    return { seq: this.#seq, messageKey };
+    let release!: () => void;
+    const previous = this.#pending;
+    this.#pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      this.#seq += 1;
+      const seq = this.#seq;
+      const messageKey = await deriveMessageKey(this.#chainKey, seq);
+      const nextChainKey = await deriveNextChainKey(this.#chainKey, seq);
+      zeroize(this.#chainKey);
+      this.#chainKey = nextChainKey;
+      return { seq, messageKey };
+    } finally {
+      release();
+    }
   }
 
   destroy(): void {
@@ -48,6 +60,7 @@ export class ReceiveRatchet {
   #lastAcceptedSeq = 0;
   #seen = new Set<number>();
   #skipped = new Map<number, Uint8Array>();
+  #pending = Promise.resolve();
 
   constructor(
     chainKey: Uint8Array,
@@ -58,50 +71,57 @@ export class ReceiveRatchet {
   }
 
   async messageKey(seq: number, _kind: string): Promise<Uint8Array | null> {
-    if (!Number.isSafeInteger(seq) || seq <= 0) {
-      return null;
-    }
-    if (this.#seen.has(seq)) {
-      return null;
-    }
-    if (seq <= this.#lastAcceptedSeq - this.replayWindow) {
-      return null;
-    }
-    const skipped = this.#skipped.get(seq);
-    if (skipped) {
-      this.#skipped.delete(seq);
-      return skipped;
-    }
-    if (seq <= this.#highestDerivedSeq) {
-      return null;
-    }
-    if (seq - this.#highestDerivedSeq > this.maxSkipped + 1) {
-      return null;
-    }
-    while (this.#highestDerivedSeq < seq) {
-      const nextSeq = this.#highestDerivedSeq + 1;
-      const messageKey = await deriveMessageKey(this.#chainKey, nextSeq);
-      const nextChainKey = await deriveNextChainKey(this.#chainKey, nextSeq);
-      zeroize(this.#chainKey);
-      this.#chainKey = nextChainKey;
-      this.#highestDerivedSeq = nextSeq;
-      if (nextSeq === seq) {
-        return messageKey;
+    let release!: () => void;
+    const previous = this.#pending;
+    this.#pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      if (!Number.isSafeInteger(seq) || seq <= 0) {
+        return null;
       }
-      this.#skipped.set(nextSeq, messageKey);
-      this.trimSkipped();
+      if (this.#seen.has(seq)) {
+        return null;
+      }
+      if (seq <= this.#lastAcceptedSeq - this.replayWindow) {
+        return null;
+      }
+      const skipped = this.#skipped.get(seq);
+      if (skipped) {
+        this.#skipped.delete(seq);
+        return skipped;
+      }
+      if (seq <= this.#highestDerivedSeq) {
+        return null;
+      }
+      if (seq - this.#highestDerivedSeq > this.maxSkipped + 1) {
+        return null;
+      }
+      while (this.#highestDerivedSeq < seq) {
+        const nextSeq = this.#highestDerivedSeq + 1;
+        const messageKey = await deriveMessageKey(this.#chainKey, nextSeq);
+        const nextChainKey = await deriveNextChainKey(this.#chainKey, nextSeq);
+        zeroize(this.#chainKey);
+        this.#chainKey = nextChainKey;
+        this.#highestDerivedSeq = nextSeq;
+        if (nextSeq === seq) {
+          return messageKey;
+        }
+        this.#skipped.set(nextSeq, messageKey);
+        this.trimSkipped();
+      }
+      return null;
+    } finally {
+      release();
     }
-    return null;
   }
 
   markAccepted(seq: number): void {
     this.#seen.add(seq);
     this.#lastAcceptedSeq = Math.max(this.#lastAcceptedSeq, seq);
-    for (const seenSeq of this.#seen) {
-      if (seenSeq <= this.#lastAcceptedSeq - this.replayWindow) {
-        this.#seen.delete(seenSeq);
-      }
-    }
+    const minRetainedSeq = this.#lastAcceptedSeq - this.replayWindow;
+    this.#seen = new Set([...this.#seen].filter((seenSeq) => seenSeq > minRetainedSeq));
   }
 
   restoreSkipped(seq: number, messageKey: Uint8Array): void {

@@ -30,7 +30,17 @@ export type MembersMessage = {
   }>;
 };
 
-export type RelayKind = "profile" | "text" | "image" | "file-meta" | "file-chunk" | "file-done" | "private";
+export type RelayKind =
+  | "profile"
+  | "text"
+  | "image"
+  | "file-meta"
+  | "file-chunk"
+  | "file-done"
+  | "private"
+  | "call-signal"
+  | "call-control"
+  | "call-media";
 
 export type RelayEnvelope = {
   v: 3;
@@ -53,6 +63,33 @@ export type PlainPayload =
   | { type: "file-meta"; fileId: string; name: string; mime: string; size: number; chunks: number; createdAt: number }
   | { type: "file-chunk"; fileId: string; index: number; total: number; bytes: string }
   | { type: "file-done"; fileId: string; sha256: string }
+  | {
+      type: "call-offer";
+      callId: string;
+      media: "audio" | "video";
+      mode: "encoded-media";
+      /** Reserved for future room calls. Current UI sends exactly one peer id. */
+      targetIds?: string[];
+      createdAt: number;
+    }
+  | { type: "call-answer"; callId: string; mode: "encoded-media"; createdAt: number }
+  | { type: "call-end"; callId: string; reason?: string; createdAt: number }
+  | {
+      type: "call-media";
+      callId: string;
+      media: "audio" | "video";
+      seq: number;
+      codec: string;
+      chunkType: "key" | "delta";
+      timestamp: number;
+      duration: number;
+      bytes: string;
+      width?: number;
+      height?: number;
+      sampleRate?: number;
+      numberOfChannels?: number;
+      createdAt: number;
+    }
   | { type: "private"; inner: PlainPayload };
 
 export type RelayAad = {

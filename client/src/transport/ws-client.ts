@@ -4,7 +4,7 @@ import { parseJsonObject, validateServerMessage } from "../protocol/validator";
 export type WsClientHandlers = {
   open: () => void;
   close: () => void;
-  message: (message: ServerMessage) => void;
+  message: (message: ServerMessage) => void | Promise<void>;
   status: (status: string) => void;
 };
 
@@ -12,6 +12,7 @@ export class WsClient {
   #socket: WebSocket | null = null;
   #closed = false;
   #attempt = 0;
+  #reconnectTimer: number | null = null;
 
   constructor(
     private readonly url: string,
@@ -20,6 +21,10 @@ export class WsClient {
   ) {}
 
   connect(): void {
+    if (this.#reconnectTimer !== null) {
+      window.clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
+    }
     this.#closed = false;
     this.handlers.status("连接中");
     const socket = new WebSocket(this.url);
@@ -39,7 +44,9 @@ export class WsClient {
         return;
       }
       try {
-        this.handlers.message(parsed as ServerMessage);
+        void Promise.resolve(this.handlers.message(parsed as ServerMessage)).catch(() => {
+          this.handlers.status("消息处理失败");
+        });
       } catch {
         this.handlers.status("消息处理失败");
       }
@@ -53,7 +60,12 @@ export class WsClient {
         this.handlers.status("已断开，正在重连");
         const delay = Math.min(500 * 2 ** this.#attempt, 5_000);
         this.#attempt += 1;
-        window.setTimeout(() => this.connect(), delay);
+        this.#reconnectTimer = window.setTimeout(() => {
+          this.#reconnectTimer = null;
+          if (!this.#closed) {
+            this.connect();
+          }
+        }, delay);
       }
     });
     socket.addEventListener("error", () => {
@@ -70,8 +82,16 @@ export class WsClient {
     return true;
   }
 
+  bufferedAmount(): number {
+    return this.#socket?.bufferedAmount ?? 0;
+  }
+
   close(): void {
     this.#closed = true;
+    if (this.#reconnectTimer !== null) {
+      window.clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
+    }
     this.#socket?.close(1000, "client closing");
     this.#socket = null;
   }

@@ -1,9 +1,8 @@
 import { aesGcmDecrypt, aesGcmEncrypt } from "./aead";
-import { base64urlDecode, base64urlEncode, stringFromBase64url } from "./base64url";
-import { fromUtf8, utf8, zeroize } from "./bytes";
+import { base64urlDecode, base64urlEncode } from "./base64url";
+import { asBufferSource, utf8, zeroize } from "./bytes";
 import { hkdf, pbkdf2Sha256 } from "./kdf";
 import { randomBytes } from "./random";
-import { stableJson } from "./stable-json";
 
 export type InviteMode = "single-link" | "two-channel";
 export type InviteKdf = "pbkdf2-sha256" | "argon2id";
@@ -31,6 +30,7 @@ export type InviteCapsule = {
   v: 3;
   mode: "two-channel";
   kdf: InviteKdf;
+  format: "compact-v1";
   salt: string;
   iterations?: number;
   ops?: number;
@@ -50,10 +50,19 @@ export type RoomSecrets = {
   fileKey: Uint8Array;
 };
 
-export const INVITE_PBKDF2_DEFAULT_ITERATIONS = 600_000;
-export const INVITE_PBKDF2_MIN_ITERATIONS = 600_000;
+export const INVITE_PBKDF2_DEFAULT_ITERATIONS = 1_200_000;
+export const INVITE_PBKDF2_MIN_ITERATIONS = 1_200_000;
 export const INVITE_PBKDF2_MAX_ITERATIONS = 5_000_000;
 
+const COMPACT_TWO_CHANNEL_PREFIX = "c3.";
+const COMPACT_SINGLE_LINK_PREFIX = "s3.";
+const SINGLE_LINK_SEED_BYTES = 32;
+const COMPACT_SECRET_BYTES = 51;
+const COMPACT_CAPSULE_HEADER_BYTES = 36;
+const COMPACT_KDF_PBKDF2_SHA256 = 1;
+const COMPACT_FORMAT_SECRET_V1 = 1;
+const COMPACT_SALT_BYTES = 16;
+const COMPACT_NONCE_BYTES = 12;
 const ROOM_SECRET_SALT = utf8("secure-chat/v3/room-secret/salt");
 const ROOM_ID_SALT = utf8("secure-chat/v3/room-id/salt");
 
@@ -67,6 +76,135 @@ function normalizeInviteIterations(iterations: number | undefined): number {
     throw new Error("unsupported invite iterations");
   }
   return value;
+}
+
+function assertUnixMs(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error("invalid invite timestamp");
+  }
+}
+
+function compactSecretBytes(secret: InviteSecret): Uint8Array {
+  const roomSeed = base64urlDecode(secret.roomSeed);
+  if (secret.v !== 3 || roomSeed.length !== 32) {
+    throw new Error("invalid invite secret");
+  }
+  assertUnixMs(secret.createdAt);
+  if (secret.expiresAt !== null) {
+    assertUnixMs(secret.expiresAt);
+  }
+  if (!Number.isSafeInteger(secret.maxMembers) || secret.maxMembers <= 0 || secret.maxMembers > 255) {
+    throw new Error("invalid invite member cap");
+  }
+  const out = new Uint8Array(COMPACT_SECRET_BYTES);
+  const view = new DataView(asBufferSource(out).buffer);
+  out[0] = 3;
+  out.set(roomSeed, 1);
+  view.setBigUint64(33, BigInt(secret.createdAt), false);
+  view.setBigUint64(41, BigInt(secret.expiresAt ?? 0), false);
+  out[49] = secret.maxMembers;
+  out[50] =
+    (secret.features.files ? 1 : 0) |
+    (secret.features.privateMessages ? 2 : 0) |
+    (secret.features.coverTraffic ? 4 : 0);
+  return out;
+}
+
+function compactSecretFromBytes(bytes: Uint8Array): InviteSecret {
+  if (bytes.length !== COMPACT_SECRET_BYTES || bytes[0] !== 3) {
+    throw new Error("invalid compact invite secret");
+  }
+  const view = new DataView(asBufferSource(bytes).buffer);
+  const createdAt = Number(view.getBigUint64(33, false));
+  const expiresAtRaw = Number(view.getBigUint64(41, false));
+  const maxMembers = bytes[49]!;
+  const flags = bytes[50]!;
+  assertUnixMs(createdAt);
+  if (expiresAtRaw > 0) {
+    assertUnixMs(expiresAtRaw);
+  }
+  if (maxMembers <= 0) {
+    throw new Error("invalid invite member cap");
+  }
+  return {
+    v: 3,
+    roomSeed: base64urlEncode(bytes.slice(1, 33)),
+    createdAt,
+    expiresAt: expiresAtRaw === 0 ? null : expiresAtRaw,
+    maxMembers,
+    features: {
+      files: (flags & 1) !== 0,
+      privateMessages: (flags & 2) !== 0,
+      coverTraffic: (flags & 4) !== 0
+    }
+  };
+}
+
+function defaultInviteSecret(roomSeed: string): InviteSecret {
+  return {
+    v: 3,
+    roomSeed,
+    createdAt: Date.now(),
+    expiresAt: null,
+    maxMembers: 16,
+    features: {
+      files: true,
+      privateMessages: true,
+      coverTraffic: false
+    }
+  };
+}
+
+function encodeCompactCapsule(capsule: InviteCapsule): string {
+  if (capsule.kdf !== "pbkdf2-sha256" || capsule.ops !== undefined || capsule.mem !== undefined) {
+    throw new Error("unsupported compact invite");
+  }
+  const salt = base64urlDecode(capsule.salt);
+  const nonce = base64urlDecode(capsule.nonce);
+  const ct = base64urlDecode(capsule.ct);
+  if (salt.length !== COMPACT_SALT_BYTES || nonce.length !== COMPACT_NONCE_BYTES) {
+    throw new Error("invalid compact invite");
+  }
+  const iterations = normalizeInviteIterations(capsule.iterations);
+  const out = new Uint8Array(COMPACT_CAPSULE_HEADER_BYTES + ct.length);
+  const view = new DataView(asBufferSource(out).buffer);
+  out[0] = 3;
+  out[1] = 2;
+  out[2] = COMPACT_KDF_PBKDF2_SHA256;
+  out[3] = COMPACT_FORMAT_SECRET_V1;
+  view.setUint32(4, iterations, false);
+  out.set(salt, 8);
+  out.set(nonce, 24);
+  out.set(ct, COMPACT_CAPSULE_HEADER_BYTES);
+  return `${COMPACT_TWO_CHANNEL_PREFIX}${base64urlEncode(out)}`;
+}
+
+function decodeCompactCapsule(value: string): InviteCapsule {
+  const bytes = base64urlDecode(value.slice(COMPACT_TWO_CHANNEL_PREFIX.length));
+  if (
+    bytes.length <= COMPACT_CAPSULE_HEADER_BYTES ||
+    bytes[0] !== 3 ||
+    bytes[1] !== 2 ||
+    bytes[2] !== COMPACT_KDF_PBKDF2_SHA256
+  ) {
+    throw new Error("invalid compact invite");
+  }
+  const format = bytes[3];
+  if (format !== COMPACT_FORMAT_SECRET_V1) {
+    throw new Error("invalid compact invite format");
+  }
+  const view = new DataView(asBufferSource(bytes).buffer);
+  const iterations = normalizeInviteIterations(view.getUint32(4, false));
+  return {
+    v: 3,
+    mode: "two-channel",
+    kdf: "pbkdf2-sha256",
+    format: "compact-v1",
+    iterations,
+    salt: base64urlEncode(bytes.slice(8, 24)),
+    nonce: base64urlEncode(bytes.slice(24, COMPACT_CAPSULE_HEADER_BYTES)),
+    ct: base64urlEncode(bytes.slice(COMPACT_CAPSULE_HEADER_BYTES))
+  };
 }
 
 export function createInviteSecret(options?: Partial<Omit<InviteSecret, "v" | "roomSeed" | "createdAt">>): InviteSecret {
@@ -85,15 +223,32 @@ export function createInviteSecret(options?: Partial<Omit<InviteSecret, "v" | "r
 }
 
 export function encodeInvite(invite: ParsedInvite): string {
-  return base64urlEncode(utf8(stableJson(invite)));
+  if (invite.mode === "single-link") {
+    const roomSeed = base64urlDecode(invite.secret.roomSeed);
+    if (invite.secret.v !== 3 || roomSeed.length !== SINGLE_LINK_SEED_BYTES) {
+      throw new Error("invalid invite secret");
+    }
+    return `${COMPACT_SINGLE_LINK_PREFIX}${base64urlEncode(roomSeed)}`;
+  }
+  return encodeCompactCapsule(invite);
 }
 
 export function decodeInvite(value: string): ParsedInvite {
-  const parsed = JSON.parse(stringFromBase64url(value)) as ParsedInvite;
-  if (parsed?.v !== 3 || (parsed.mode !== "single-link" && parsed.mode !== "two-channel")) {
-    throw new Error("invalid invite");
+  if (value.startsWith(COMPACT_SINGLE_LINK_PREFIX)) {
+    const roomSeed = base64urlDecode(value.slice(COMPACT_SINGLE_LINK_PREFIX.length));
+    if (roomSeed.length !== SINGLE_LINK_SEED_BYTES) {
+      throw new Error("invalid compact invite");
+    }
+    return {
+      v: 3,
+      mode: "single-link",
+      secret: defaultInviteSecret(base64urlEncode(roomSeed))
+    };
   }
-  return parsed;
+  if (value.startsWith(COMPACT_TWO_CHANNEL_PREFIX)) {
+    return decodeCompactCapsule(value);
+  }
+  throw new Error("invalid compact invite");
 }
 
 export function createSingleLinkInvite(secret = createInviteSecret()): SingleLinkInvite {
@@ -113,13 +268,21 @@ export async function wrapInviteSecret(
   const iterations = normalizeInviteIterations(options.iterations);
   const passKey = await pbkdf2Sha256(passphrase, salt, iterations);
   const inviteKey = await hkdf(passKey, "secure-chat/v3/invite-wrap", salt, 32);
-  const ct = await aesGcmEncrypt(inviteKey, nonce, utf8("invite-v3"), utf8(stableJson(secret)));
+  const plaintext = compactSecretBytes(secret);
+  const ct = await (async () => {
+    try {
+      return await aesGcmEncrypt(inviteKey, nonce, utf8("invite-v3"), plaintext);
+    } finally {
+      zeroize(plaintext);
+    }
+  })();
   zeroize(passKey);
   zeroize(inviteKey);
   return {
     v: 3,
     mode: "two-channel",
     kdf: "pbkdf2-sha256",
+    format: "compact-v1",
     salt: base64urlEncode(salt),
     iterations,
     nonce: base64urlEncode(nonce),
@@ -138,7 +301,10 @@ export async function unwrapInviteCapsule(capsule: InviteCapsule, passphrase: st
   const inviteKey = await hkdf(passKey, "secure-chat/v3/invite-wrap", salt, 32);
   try {
     const plaintext = await aesGcmDecrypt(inviteKey, nonce, utf8("invite-v3"), base64urlDecode(capsule.ct));
-    const secret = JSON.parse(fromUtf8(plaintext)) as InviteSecret;
+    if (capsule.format !== "compact-v1") {
+      throw new Error("unsupported invite format");
+    }
+    const secret = compactSecretFromBytes(plaintext);
     if (secret.v !== 3 || base64urlDecode(secret.roomSeed).length !== 32) {
       throw new Error("invalid invite secret");
     }
@@ -181,7 +347,7 @@ export async function deriveRoomSecrets(secret: InviteSecret): Promise<RoomSecre
 
 export function readInviteFromLocation(location: Location): string | null {
   const params = new URLSearchParams(location.hash.startsWith("#") ? location.hash.slice(1) : location.hash);
-  return params.get("invite");
+  return params.get("i");
 }
 
 export function clearLocationFragment(): void {

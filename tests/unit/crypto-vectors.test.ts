@@ -5,6 +5,7 @@ import { base64urlEncode } from "../../client/src/crypto/base64url";
 import { ReceiveRatchet, SendRatchet } from "../../client/src/crypto/ratchet";
 import { openPayload, sealPayload } from "../../client/src/protocol/envelope";
 import type { CapabilitySet } from "../../client/src/protocol/types";
+import { hkdf } from "../../client/src/crypto/kdf";
 
 const secret: InviteSecret = {
   v: 3,
@@ -16,6 +17,10 @@ const secret: InviteSecret = {
 };
 
 describe("pairwise crypto", () => {
+  it("requires explicit non-empty HKDF salt", async () => {
+    await expect(hkdf(new Uint8Array(32), "test", new Uint8Array(), 32)).rejects.toThrow("hkdf salt required");
+  });
+
   it("rejects invalid P-256 public points through WebCrypto", async () => {
     const zeroPoint = base64urlEncode(new Uint8Array([4, ...new Uint8Array(64)]));
     await expect(importPeerPublicKey(zeroPoint)).rejects.toThrow();

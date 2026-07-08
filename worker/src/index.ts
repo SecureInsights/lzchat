@@ -2,6 +2,8 @@ import { json, withSecurityHeaders } from "./security-headers";
 import {
   CLIENT_TIMEOUT_MS,
   MAX_BAD_MESSAGES,
+  MAX_CALL_MEDIA_BYTES_PER_WINDOW,
+  MAX_CALL_MEDIA_MESSAGES_PER_WINDOW,
   MAX_MESSAGES_PER_WINDOW,
   MAX_RELAY_SIZE,
   MAX_ROOM_MEMBERS,
@@ -34,6 +36,8 @@ type ClientState = {
   seenAt: number;
   joinedAt: number;
   rateWindow: number[];
+  mediaRateWindow: number[];
+  byteWindow: Array<{ seenAt: number; bytes: number }>;
   badMessages: number;
 };
 
@@ -99,16 +103,19 @@ export class ChatRoom {
       return;
     }
     state.seenAt = Date.now();
-    if (!this.acceptRate(state)) {
-      this.bad(socket);
-      return;
-    }
     const relay = validateRelayEnvelope(parsed, this.#roomId, state.clientId, (clientId) => this.#clients.has(clientId));
     if (!relay) {
       this.bad(socket);
       return;
     }
-    this.#clients.get(relay.to)?.socket.send(JSON.stringify(relay));
+    if (!this.acceptRate(state, relay.kind === "call-media", relay.ct.length)) {
+      this.bad(socket);
+      return;
+    }
+    const target = this.#clients.get(relay.to);
+    if (target) {
+      this.safeSend(target.socket, JSON.stringify(relay));
+    }
   }
 
   private join(socket: WebSocket, join: JoinMessage): void {
@@ -131,6 +138,8 @@ export class ChatRoom {
       seenAt: Date.now(),
       joinedAt: Date.now(),
       rateWindow: [],
+      mediaRateWindow: [],
+      byteWindow: [],
       badMessages: 0
     };
     if (join.identityPub) {
@@ -142,8 +151,19 @@ export class ChatRoom {
     this.broadcastMembers();
   }
 
-  private acceptRate(state: ClientState): boolean {
+  private acceptRate(state: ClientState, mediaBurst = false, bytes = 0): boolean {
     const now = Date.now();
+    if (mediaBurst) {
+      state.mediaRateWindow = state.mediaRateWindow.filter((seen) => now - seen < RATE_WINDOW_MS);
+      state.mediaRateWindow.push(now);
+      state.byteWindow = state.byteWindow.filter((item) => now - item.seenAt < RATE_WINDOW_MS);
+      state.byteWindow.push({ seenAt: now, bytes });
+      const totalBytes = state.byteWindow.reduce((sum, item) => sum + item.bytes, 0);
+      if (totalBytes > MAX_CALL_MEDIA_BYTES_PER_WINDOW) {
+        return false;
+      }
+      return state.mediaRateWindow.length <= MAX_CALL_MEDIA_MESSAGES_PER_WINDOW;
+    }
     state.rateWindow = state.rateWindow.filter((seen) => now - seen < RATE_WINDOW_MS);
     state.rateWindow.push(now);
     return state.rateWindow.length <= MAX_MESSAGES_PER_WINDOW;
@@ -198,7 +218,16 @@ export class ChatRoom {
     });
     const message = JSON.stringify({ v: 3, t: "members", roomId: this.#roomId, epoch: this.#epoch, members });
     for (const client of this.#clients.values()) {
-      client.socket.send(message);
+      this.safeSend(client.socket, message);
+    }
+  }
+
+  private safeSend(socket: WebSocket, message: string): void {
+    try {
+      socket.send(message);
+    } catch {
+      socket.close(1011, "send_failed");
+      this.removeSocket(socket);
     }
   }
 

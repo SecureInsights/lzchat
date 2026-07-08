@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { validateJoinMessage, validatePlainPayload, validateRelayEnvelope } from "../../client/src/protocol/validator";
+import {
+  MAX_FILE_BYTES,
+  MAX_FILE_CHUNK_BYTES_B64,
+  MAX_FILE_CHUNKS,
+  MAX_CALL_AUDIO_BYTES_B64,
+  MAX_CALL_VIDEO_BYTES_B64,
+  validateJoinMessage,
+  validatePlainPayload,
+  validateRelayEnvelope
+} from "../../client/src/protocol/validator";
 
 const roomId = "abcdefghijklmnop";
 const clientA = "clientclientclientA";
@@ -65,6 +74,27 @@ describe("envelope validator", () => {
     ).toBeNull();
   });
 
+  it("accepts encrypted call control relay envelopes", () => {
+    expect(
+      validateRelayEnvelope(
+        {
+          v: 3,
+          t: "relay",
+          roomId,
+          from: clientA,
+          to: clientB,
+          kind: "call-control",
+          seq: 1,
+          nonce: "abc",
+          ct: "ciphertext"
+        },
+        roomId,
+        clientA,
+        () => true
+      )
+    ).not.toBeNull();
+  });
+
   it("rejects invalid base64url payload lengths", () => {
     expect(
       validatePlainPayload({
@@ -114,5 +144,197 @@ describe("envelope validator", () => {
         createdAt: 1
       })
     ).not.toBeNull();
+  });
+
+  it("validates file metadata MIME and chunk bounds", () => {
+    const validMeta = {
+      type: "file-meta",
+      fileId: "filefilefilefile",
+      name: "report.txt",
+      mime: "text/plain",
+      size: 1024,
+      chunks: 1,
+      createdAt: 1
+    };
+
+    expect(validatePlainPayload(validMeta)).not.toBeNull();
+    expect(validatePlainPayload({ ...validMeta, mime: "text/html<script>" })).toBeNull();
+    expect(validatePlainPayload({ ...validMeta, mime: "Text/Plain" })).toBeNull();
+    expect(validatePlainPayload({ ...validMeta, mime: "application/java--script" })).toBeNull();
+    expect(validatePlainPayload({ ...validMeta, size: MAX_FILE_BYTES + 1 })).toBeNull();
+    expect(validatePlainPayload({ ...validMeta, chunks: MAX_FILE_CHUNKS + 1 })).toBeNull();
+    expect(validatePlainPayload({ ...validMeta, size: 1, chunks: 2 })).toBeNull();
+  });
+
+  it("limits file chunk totals and encoded chunk size", () => {
+    expect(
+      validatePlainPayload({
+        type: "file-chunk",
+        fileId: "filefilefilefile",
+        index: 0,
+        total: MAX_FILE_CHUNKS + 1,
+        bytes: "AAA"
+      })
+    ).toBeNull();
+    expect(
+      validatePlainPayload({
+        type: "file-chunk",
+        fileId: "filefilefilefile",
+        index: 0,
+        total: 1,
+        bytes: "A".repeat(MAX_FILE_CHUNK_BYTES_B64 + 1)
+      })
+    ).toBeNull();
+  });
+
+  it("validates call signaling payloads", () => {
+    const validOffer = {
+      type: "call-offer",
+      callId: "callcallcallcall",
+      media: "video",
+      mode: "encoded-media",
+      targetIds: [clientB],
+      createdAt: 1
+    };
+    expect(validatePlainPayload(validOffer)).not.toBeNull();
+    expect(validatePlainPayload({ ...validOffer, media: "screen" })).toBeNull();
+    expect(validatePlainPayload({ ...validOffer, targetIds: ["bad id"] })).toBeNull();
+    expect(validatePlainPayload({ ...validOffer, mode: "webrtc" })).toBeNull();
+    expect(
+      validatePlainPayload({
+        type: "call-answer",
+        callId: "callcallcallcall",
+        mode: "encoded-media",
+        createdAt: 1
+      })
+    ).not.toBeNull();
+    expect(
+      validatePlainPayload({
+        type: "call-media",
+        callId: "callcallcallcall",
+        media: "video",
+        seq: 0,
+        codec: "vp8",
+        chunkType: "key",
+        timestamp: 1,
+        duration: 0,
+        width: 480,
+        height: 270,
+        bytes: "AAA",
+        createdAt: 1
+      })
+    ).not.toBeNull();
+    expect(
+      validatePlainPayload({
+        type: "call-media",
+        callId: "callcallcallcall",
+        media: "video",
+        seq: 0,
+        codec: "avc1.42C01F",
+        chunkType: "key",
+        timestamp: 1,
+        duration: 0,
+        width: 480,
+        height: 270,
+        bytes: "AAA",
+        createdAt: 1
+      })
+    ).not.toBeNull();
+    expect(
+      validatePlainPayload({
+        type: "call-media",
+        callId: "callcallcallcall",
+        media: "video",
+        seq: 0,
+        codec: "avc1.42c01e",
+        chunkType: "key",
+        timestamp: 1,
+        duration: 0,
+        width: 480,
+        height: 270,
+        bytes: "AAA",
+        createdAt: 1
+      })
+    ).not.toBeNull();
+    expect(
+      validatePlainPayload({
+        type: "call-media",
+        callId: "callcallcallcall",
+        media: "video",
+        seq: 0,
+        codec: "av01.0.04M.08",
+        chunkType: "key",
+        timestamp: 1,
+        duration: 0,
+        width: 480,
+        height: 270,
+        bytes: "AAA",
+        createdAt: 1
+      })
+    ).not.toBeNull();
+    expect(
+      validatePlainPayload({
+        type: "call-media",
+        callId: "callcallcallcall",
+        media: "video",
+        seq: 0,
+        codec: "vp8<script>",
+        chunkType: "key",
+        timestamp: 1,
+        duration: 0,
+        width: 480,
+        height: 270,
+        bytes: "AAA",
+        createdAt: 1
+      })
+    ).toBeNull();
+    expect(
+      validatePlainPayload({
+        type: "call-media",
+        callId: "callcallcallcall",
+        media: "audio",
+        seq: 0,
+        codec: "vp8",
+        chunkType: "key",
+        timestamp: 1,
+        duration: 0,
+        sampleRate: 48000,
+        numberOfChannels: 1,
+        bytes: "AAA",
+        createdAt: 1
+      })
+    ).toBeNull();
+    expect(
+      validatePlainPayload({
+        type: "call-media",
+        callId: "callcallcallcall",
+        media: "audio",
+        seq: 0,
+        codec: "opus",
+        chunkType: "key",
+        timestamp: 1,
+        duration: 0,
+        sampleRate: 48000,
+        numberOfChannels: 1,
+        bytes: "A".repeat(MAX_CALL_AUDIO_BYTES_B64 + 1),
+        createdAt: 1
+      })
+    ).toBeNull();
+    expect(
+      validatePlainPayload({
+        type: "call-media",
+        callId: "callcallcallcall",
+        media: "video",
+        seq: 0,
+        codec: "vp8",
+        chunkType: "key",
+        timestamp: 1,
+        duration: 0,
+        width: 480,
+        height: 270,
+        bytes: "A".repeat(MAX_CALL_VIDEO_BYTES_B64 + 1),
+        createdAt: 1
+      })
+    ).toBeNull();
   });
 });
