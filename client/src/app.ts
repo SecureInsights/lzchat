@@ -367,7 +367,7 @@ const MAX_ROOM_NAME_CHARS = 60;
 const DEFAULT_ROOM_NAME = "临时房间";
 const MEDIA_RATCHET_WINDOW = 1024;
 const MEDIA_MAX_SKIPPED_KEYS = 1024;
-const PEER_MAX_CALL_MEDIA_BYTES_PER_WINDOW = 8 * 1024 * 1024;
+const PEER_MAX_CALL_MEDIA_BYTES_PER_WINDOW = 12 * 1024 * 1024;
 const CALL_MAX_VIDEO_CHUNK_BYTES = 128 * 1024;
 const CALL_MAX_AUDIO_CHUNK_BYTES = 16 * 1024;
 const CALL_MAX_MEDIA_SEND_FAILURES = 8;
@@ -2777,8 +2777,7 @@ function handleMediaSendFailure(call: CallRuntime): void {
     return;
   }
   call.mediaFailureNotified = true;
-  addSystemMessage("媒体发送连续失败，通话已自动结束。");
-  void finishCall("media-send-failed", true);
+  addSystemMessage("媒体发送连续失败，正在尝试恢复。");
 }
 
 function cleanupEncodedPublisher(publisher: EncodedCallPublisher | null): void {
