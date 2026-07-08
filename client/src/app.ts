@@ -234,6 +234,7 @@ type EncodedCallPublisher = {
   videoSeq: number;
   audioSeq: number;
   lastKeyFrameAt: number;
+  lastVideoEncodeAt: number;
 };
 
 type EncodedCallReceiver = {
@@ -366,7 +367,7 @@ const MAX_ROOM_NAME_CHARS = 60;
 const DEFAULT_ROOM_NAME = "临时房间";
 const MEDIA_RATCHET_WINDOW = 1024;
 const MEDIA_MAX_SKIPPED_KEYS = 1024;
-const PEER_MAX_CALL_MEDIA_BYTES_PER_WINDOW = 6 * 1024 * 1024;
+const PEER_MAX_CALL_MEDIA_BYTES_PER_WINDOW = 8 * 1024 * 1024;
 const CALL_MAX_VIDEO_CHUNK_BYTES = 128 * 1024;
 const CALL_MAX_AUDIO_CHUNK_BYTES = 16 * 1024;
 const CALL_MAX_MEDIA_SEND_FAILURES = 8;
@@ -387,8 +388,9 @@ const DISPLAY_IMAGE_MIME_RE = /^image\/(?:png|jpeg|jpg|gif|webp|avif|bmp)$/u;
 const MIME_TYPE_RE = /^[a-z][a-z0-9]*\/[a-z][a-z0-9]*(?:[.+-][a-z0-9]+)*$/u;
 const DANGEROUS_DOWNLOAD_MIME_RE =
   /^(?:text\/html|text\/javascript|application\/(?:javascript|x-javascript|ecmascript|x-msdownload|x-sh|x-bat|x-csh)|image\/svg\+xml)$/u;
-const PEER_MAX_CALL_MEDIA_MESSAGES_PER_WINDOW = 1_200;
+const PEER_MAX_CALL_MEDIA_MESSAGES_PER_WINDOW = 2_000;
 const CALL_MEDIA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
+const CALL_VIDEO_ENCODER_QUEUE_LIMIT = 2;
 const CALL_VIDEO_WIDTH = 640;
 const CALL_VIDEO_HEIGHT = 360;
 const CALL_VIDEO_FPS = 30;
@@ -1287,7 +1289,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       recvRatchet,
       mediaSendRatchet,
       mediaRecvRatchet,
-      fingerprint: await peerFingerprint(state.room.roomId, member.sessionPub),
+      fingerprint: "计算中",
       profileSent: false,
       messageWindow: existing?.messageWindow ?? [],
       mediaMessageWindow: existing?.mediaMessageWindow ?? [],
@@ -1295,11 +1297,29 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       decryptFailures: 0,
       lastFailureNoticeAt: 0
     });
+    void updatePeerFingerprint(state, member.clientId, member.sessionPub);
   }
   renderChat();
   await sendProfilesToAll();
   await processPendingRelays();
   void updateRoomSafetyCode(state, message.members, membersEpoch);
+}
+
+async function updatePeerFingerprint(
+  state: Runtime,
+  clientId: string,
+  sessionPub: string
+): Promise<void> {
+  const fingerprint = await peerFingerprint(state.room.roomId, sessionPub);
+  if (runtime !== state) {
+    return;
+  }
+  const peer = state.peers.get(clientId);
+  if (!peer || peer.sessionPub !== sessionPub) {
+    return;
+  }
+  peer.fingerprint = fingerprint;
+  renderChat();
 }
 
 async function updateRoomSafetyCode(
@@ -1839,9 +1859,9 @@ function sendCallEndSignal(
   }
 }
 
-async function sendCallMedia(state: Runtime, peer: PeerRuntime, payload: CallMediaPayload): Promise<void> {
+async function sendCallMedia(state: Runtime, peer: PeerRuntime, payload: CallMediaPayload): Promise<boolean> {
   if (state.ws.bufferedAmount() > CALL_MEDIA_BUFFER_HIGH_WATER_BYTES) {
-    return;
+    return false;
   }
   const envelope = await sealPayload({
     roomId: state.room.roomId,
@@ -1852,7 +1872,7 @@ async function sendCallMedia(state: Runtime, peer: PeerRuntime, payload: CallMed
     ratchet: peer.mediaSendRatchet,
     payload
   });
-  state.ws.send(envelope);
+  return state.ws.send(envelope);
 }
 
 function webCodecsRuntime(): WebCodecsRuntime {
@@ -2496,7 +2516,8 @@ async function startEncodedPublisher(state: Runtime, call: CallRuntime, peer: Pe
     audioConfig: null,
     videoSeq: 0,
     audioSeq: 0,
-    lastKeyFrameAt: 0
+    lastKeyFrameAt: 0,
+    lastVideoEncodeAt: 0
   };
   call.publisher = publisher;
   let startedTrack = false;
@@ -2552,7 +2573,14 @@ async function startEncodedVideo(
     if (publisher.closed || runtime !== state || state.call !== call || !publisher.videoEncoder) {
       return;
     }
-    if (!call.cameraOff && publisher.videoEncoder.encodeQueueSize < 3 && video.readyState >= 2) {
+    const queueSize = publisher.videoEncoder.encodeQueueSize;
+    const congested =
+      queueSize >= CALL_VIDEO_ENCODER_QUEUE_LIMIT ||
+      state.ws.bufferedAmount() > CALL_MEDIA_BUFFER_HIGH_WATER_BYTES;
+    const tooSoon =
+      publisher.lastVideoEncodeAt > 0 &&
+      now - publisher.lastVideoEncodeAt < (1000 / CALL_VIDEO_FPS) * 0.75;
+    if (!call.cameraOff && !congested && !tooSoon && video.readyState >= 2) {
       const timestamp = Math.round(
         metadata && Number.isFinite(metadata.mediaTime)
           ? (metadata.mediaTime ?? 0) * 1_000_000
@@ -2569,12 +2597,15 @@ async function startEncodedVideo(
           publisher.lastKeyFrameAt === 0 || now - publisher.lastKeyFrameAt >= CALL_KEYFRAME_INTERVAL_MS;
         publisher.videoEncoder.encode(frame, { keyFrame });
         frame.close();
+        publisher.lastVideoEncodeAt = now;
         if (keyFrame) {
           publisher.lastKeyFrameAt = now;
         }
       } catch {
         // Skip a bad frame without surfacing noisy decoder details.
       }
+    } else if (congested) {
+      publisher.lastKeyFrameAt = 0;
     }
     if (video.requestVideoFrameCallback) {
       publisher.videoCallbackId = video.requestVideoFrameCallback(encodeFrame);
@@ -2605,7 +2636,7 @@ async function sendEncodedVideoChunk(
     if (bytes.byteLength > CALL_MAX_VIDEO_CHUNK_BYTES) {
       return;
     }
-    await sendCallMedia(state, peer, {
+    const sent = await sendCallMedia(state, peer, {
       type: "call-media",
       callId: call.callId,
       media: "video",
@@ -2619,13 +2650,17 @@ async function sendEncodedVideoChunk(
       bytes: base64urlEncode(bytes),
       createdAt: Date.now()
     });
+    if (!sent) {
+      publisher.lastKeyFrameAt = 0;
+      return;
+    }
     call.mediaSendFailures = 0;
+    publisher.videoSeq += 1;
   } catch {
     handleMediaSendFailure(call);
   } finally {
     zeroize(bytes);
   }
-  publisher.videoSeq += 1;
 }
 
 async function startEncodedAudio(
@@ -2710,7 +2745,7 @@ async function sendEncodedAudioChunk(
     if (bytes.byteLength > CALL_MAX_AUDIO_CHUNK_BYTES) {
       return;
     }
-    await sendCallMedia(state, peer, {
+    const sent = await sendCallMedia(state, peer, {
       type: "call-media",
       callId: call.callId,
       media: "audio",
@@ -2724,13 +2759,16 @@ async function sendEncodedAudioChunk(
       bytes: base64urlEncode(bytes),
       createdAt: Date.now()
     });
+    if (!sent) {
+      return;
+    }
     call.mediaSendFailures = 0;
+    publisher.audioSeq += 1;
   } catch {
     handleMediaSendFailure(call);
   } finally {
     zeroize(bytes);
   }
-  publisher.audioSeq += 1;
 }
 
 function handleMediaSendFailure(call: CallRuntime): void {
