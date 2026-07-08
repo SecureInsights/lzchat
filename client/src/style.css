@@ -325,6 +325,13 @@ textarea:disabled {
   color: #147eb8;
 }
 
+.badge.unread {
+  min-width: 24px;
+  background: #2aabee;
+  color: #ffffff;
+  font-weight: 750;
+}
+
 .chat-main {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr) auto;
@@ -390,6 +397,11 @@ textarea:disabled {
   font-size: 13px;
 }
 
+.topbar .secondary.active {
+  background: #d9f1ff;
+  color: #147eb8;
+}
+
 .mode-banner {
   justify-self: center;
   width: fit-content;
@@ -409,8 +421,8 @@ textarea:disabled {
 }
 
 .mode-banner.private {
-  background: #fff2d8;
-  color: #7c3f00;
+  background: #e5f3ff;
+  color: #17618f;
 }
 
 .messages {
@@ -441,11 +453,11 @@ textarea:disabled {
 }
 
 .message.private {
-  background: #fff3d0;
+  background: #eaf4ff;
 }
 
 .message.private.own {
-  background: #ffe4a6;
+  background: #d9ecff;
 }
 
 .message.room.own {

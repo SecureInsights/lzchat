@@ -88,10 +88,15 @@ type Runtime = {
   status: string;
   safetyCode: string;
   privatePeerId: string | null;
+  roomUnread: number;
+  privateUnread: Map<string, number>;
   inviteLink: string | null;
   invitePassphrase: string;
   inviteMode: "single-link" | "two-channel";
   incomingFiles: Map<string, IncomingFile>;
+  notificationsEnabled: boolean;
+  soundEnabled: boolean;
+  lastNotificationAt: number;
 };
 
 type DeliveryContext = {
@@ -144,10 +149,12 @@ if (pendingInviteToken) {
 }
 
 let runtime: Runtime | null = null;
+let notificationAudioContext: AudioContext | null = null;
 const MAX_RENDERED_MESSAGES = 500;
 const PEER_MESSAGE_WINDOW_MS = 10_000;
 const PEER_MAX_MESSAGES_PER_WINDOW = 120;
 const FAILURE_NOTICE_INTERVAL_MS = 5_000;
+const NOTIFICATION_THROTTLE_MS = 900;
 const MAX_PENDING_RELAYS_PER_PEER = 32;
 const MAX_INLINE_IMAGE_BYTES = 3 * 1024 * 1024;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
@@ -181,6 +188,57 @@ function isTrustedContext(): boolean {
     window.location.hostname === "localhost" ||
     window.location.hostname === "::1"
   );
+}
+
+function notificationPermission(): NotificationPermission | "unsupported" {
+  return "Notification" in window ? Notification.permission : "unsupported";
+}
+
+function isWindowActive(): boolean {
+  return document.visibilityState === "visible" && document.hasFocus();
+}
+
+async function requestDesktopNotificationPermission(): Promise<NotificationPermission | "unsupported"> {
+  if (!("Notification" in window)) {
+    return "unsupported";
+  }
+  if (Notification.permission === "default") {
+    return Notification.requestPermission();
+  }
+  return Notification.permission;
+}
+
+async function unlockNotificationSound(): Promise<boolean> {
+  const audioWindow = window as Window & { webkitAudioContext?: typeof AudioContext };
+  const AudioContextCtor = window.AudioContext ?? audioWindow.webkitAudioContext;
+  if (!AudioContextCtor) {
+    return false;
+  }
+  notificationAudioContext ??= new AudioContextCtor();
+  if (notificationAudioContext.state === "suspended") {
+    await notificationAudioContext.resume();
+  }
+  return notificationAudioContext.state === "running";
+}
+
+function playNotificationSound(): void {
+  const context = notificationAudioContext;
+  if (!context || context.state !== "running") {
+    return;
+  }
+  const now = context.currentTime;
+  const oscillator = context.createOscillator();
+  const gain = context.createGain();
+  oscillator.type = "sine";
+  oscillator.frequency.setValueAtTime(740, now);
+  oscillator.frequency.exponentialRampToValueAtTime(520, now + 0.16);
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.055, now + 0.015);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+  oscillator.connect(gain);
+  gain.connect(context.destination);
+  oscillator.start(now);
+  oscillator.stop(now + 0.2);
 }
 
 function makePassphrase(): string {
@@ -368,6 +426,26 @@ function pushMessage(state: Runtime, message: ChatMessage): void {
     for (const oldMessage of removed) {
       revokeMessageResources(oldMessage);
     }
+  }
+}
+
+function unreadLabel(count: number): string {
+  return count > 99 ? "99+" : String(count);
+}
+
+function markIncomingUnread(state: Runtime, message: ChatMessage, fromClientId: string): void {
+  if (message.own) {
+    return;
+  }
+  if (message.scope === "room") {
+    if (state.privatePeerId) {
+      state.roomUnread = Math.min(999, state.roomUnread + 1);
+    }
+    return;
+  }
+  if (state.privatePeerId !== fromClientId) {
+    const current = state.privateUnread.get(fromClientId) ?? 0;
+    state.privateUnread.set(fromClientId, Math.min(999, current + 1));
   }
 }
 
@@ -735,9 +813,14 @@ async function startRoom(input: {
     status: "连接中",
     safetyCode: "计算中",
     privatePeerId: null,
+    roomUnread: 0,
+    privateUnread: new Map(),
     inviteLink: input.inviteLink ?? null,
     invitePassphrase: input.invitePassphrase ?? "",
-    inviteMode: input.mode
+    inviteMode: input.mode,
+    notificationsEnabled: notificationPermission() === "granted",
+    soundEnabled: false,
+    lastNotificationAt: 0
   };
   renderChat();
   ws.connect();
@@ -769,6 +852,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       destroyPeer(peer);
       state.peers.delete(clientId);
       state.pendingRelays.delete(clientId);
+      state.privateUnread.delete(clientId);
     }
   }
   if (state.privatePeerId && !state.peers.has(state.privatePeerId)) {
@@ -919,7 +1003,9 @@ async function handlePlainPayload(
       message.peerName = peer.displayName;
     }
     pushMessage(state, message);
+    markIncomingUnread(state, message, peer.clientId);
     renderChat();
+    notifyIncomingMessage(state, message);
     return;
   }
   if (payload.type === "image") {
@@ -948,7 +1034,9 @@ async function handlePlainPayload(
       message.peerName = peer.displayName;
     }
     pushMessage(state, message);
+    markIncomingUnread(state, message, peer.clientId);
     renderChat();
+    notifyIncomingMessage(state, message);
     return;
   }
   if (payload.type === "file-meta") {
@@ -1085,7 +1173,9 @@ async function handleFileDone(
   }
   deleteIncomingFile(state, key);
   pushMessage(state, message);
+  markIncomingUnread(state, message, from);
   renderChat();
+  notifyIncomingMessage(state, message);
 }
 
 function addSystemMessage(text: string): void {
@@ -1103,6 +1193,71 @@ function addSystemMessage(text: string): void {
     scope: "room"
   });
   renderChat();
+}
+
+async function enableRoomNotifications(): Promise<void> {
+  const state = runtime;
+  if (!state) {
+    return;
+  }
+  const permission = await requestDesktopNotificationPermission();
+  const soundReady = await unlockNotificationSound();
+  state.notificationsEnabled = permission === "granted";
+  state.soundEnabled = soundReady;
+  if (state.notificationsEnabled && state.soundEnabled) {
+    addSystemMessage("桌面通知和声音提示已开启。");
+  } else if (state.notificationsEnabled) {
+    addSystemMessage("桌面通知已开启，当前浏览器不支持声音提示。");
+  } else if (state.soundEnabled) {
+    addSystemMessage(
+      permission === "denied" ? "浏览器通知已被拒绝，声音提示已开启。" : "声音提示已开启。"
+    );
+  } else {
+    addSystemMessage("当前浏览器无法开启通知或声音提示。");
+  }
+}
+
+function notificationButtonText(state: Runtime): string {
+  if (state.notificationsEnabled && state.soundEnabled) {
+    return "通知已开";
+  }
+  if (state.notificationsEnabled) {
+    return "打开声音";
+  }
+  if (state.soundEnabled) {
+    return "声音已开";
+  }
+  if (notificationPermission() === "denied") {
+    return "打开声音";
+  }
+  return "打开通知";
+}
+
+function notifyIncomingMessage(state: Runtime, message: ChatMessage): void {
+  const now = Date.now();
+  if (now - state.lastNotificationAt < NOTIFICATION_THROTTLE_MS) {
+    return;
+  }
+  state.lastNotificationAt = now;
+  if (state.soundEnabled) {
+    playNotificationSound();
+  }
+  if (!state.notificationsEnabled || notificationPermission() !== "granted" || isWindowActive()) {
+    return;
+  }
+  const scope = message.scope === "private" ? "私聊" : "房间";
+  const title =
+    message.scope === "private" ? `${message.author} 发来私聊消息` : `${message.author} 发来房间消息`;
+  const kindText = message.kind === "image" ? "图片消息" : message.kind === "file" ? "文件消息" : "文本消息";
+  const notification = new Notification(title, {
+    body: `收到一条${scope}${kindText}`,
+    tag: `${state.room.roomId}:${message.scope}`,
+    renotify: false
+  });
+  notification.addEventListener("click", () => {
+    window.focus();
+    notification.close();
+  });
 }
 
 function currentDeliveryContext(state: Runtime): DeliveryContext {
@@ -1349,15 +1504,20 @@ function renderChat(): void {
   });
   self.addEventListener("click", () => {
     state.privatePeerId = null;
+    state.roomUnread = 0;
     renderChat();
   });
+  const roomBadge =
+    state.roomUnread > 0
+      ? el("span", { className: "badge unread", text: unreadLabel(state.roomUnread) })
+      : el("span", { className: "badge ok", text: "房间" });
   self.append(
     el("span", { className: "member-avatar", text: avatarText(state.roomName) }),
     el("span", { className: "member-content" }, [
       el("span", { className: "member-name" }, [state.roomName]),
       el("span", { className: "member-subtitle", text: "房间" })
     ]),
-    el("span", { className: "badge ok", text: "房间" })
+    roomBadge
   );
   memberList.append(self);
   for (const peer of state.peers.values()) {
@@ -1370,9 +1530,13 @@ function renderChat(): void {
     setDataset(item, "clientId", peer.clientId);
     item.addEventListener("click", () => {
       state.privatePeerId = peer.clientId;
+      state.privateUnread.delete(peer.clientId);
       renderChat();
     });
-    const badge = isPrivateTarget
+    const unread = state.privateUnread.get(peer.clientId) ?? 0;
+    const badge = unread > 0
+      ? el("span", { className: "badge unread", text: unreadLabel(unread) })
+      : isPrivateTarget
       ? el("span", { className: "badge ok", text: "私聊" })
       : el("span", { className: "badge", text: "在线" });
     item.append(
@@ -1405,6 +1569,15 @@ function renderChat(): void {
     })
   ]);
   const topbarButtons: Node[] = [];
+  const notifications = el("button", {
+    className: state.notificationsEnabled || state.soundEnabled ? "secondary active" : "secondary",
+    text: notificationButtonText(state)
+  });
+  notifications.type = "button";
+  notifications.addEventListener("click", () => {
+    void enableRoomNotifications();
+  });
+  topbarButtons.push(notifications);
   if (state.inviteLink) {
     const invite = el("button", { className: "secondary", text: "邀请" });
     invite.addEventListener("click", () =>
