@@ -628,6 +628,12 @@ function insertTextAtCursor(input: HTMLTextAreaElement, value: string): void {
   input.focus();
 }
 
+function focusComposerInput(): void {
+  window.requestAnimationFrame(() => {
+    document.querySelector<HTMLTextAreaElement>(".composer-input")?.focus();
+  });
+}
+
 function formatBytes(size: number): string {
   if (size < 1024) {
     return `${size} B`;
@@ -3492,6 +3498,7 @@ function renderComposer(): HTMLElement {
   let selectedEmojiGroup = EMOJI_CATEGORIES[0]!.group;
   let emojiRecords: EmojiRecord[] | null = null;
   const input = el("textarea", {
+    className: "composer-input",
     placeholder: "消息"
   });
   input.rows = 1;
@@ -3648,7 +3655,9 @@ function renderComposer(): HTMLElement {
     input.value = "";
     syncInputHeight();
     emojiPanel.classList.remove("open");
-    void sendTextMessage(value);
+    void sendTextMessage(value).finally(() => {
+      focusComposerInput();
+    });
   });
   composerPill.append(emojiWrap, input, attach, fileInput);
   composer.append(composerPill, send);
