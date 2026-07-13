@@ -75,7 +75,7 @@ export type PlainPayload =
       callId: string;
       media: "audio" | "video";
       mode: "encoded-media";
-      /** Reserved for future room calls. Current UI sends exactly one peer id. */
+      /** Invited peer ids for private or room calls. */
       targetIds?: string[];
       createdAt: number;
     }

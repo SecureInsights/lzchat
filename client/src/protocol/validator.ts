@@ -37,7 +37,7 @@ export const MAX_FILE_CHUNKS = Math.ceil(MAX_FILE_BYTES / FILE_CHUNK_BYTES);
 export const MAX_FILE_CHUNK_BYTES_B64 = Math.ceil((FILE_CHUNK_BYTES * 4) / 3) + 4;
 export const MAX_FILE_NAME_CHARS = 180;
 export const MAX_CALL_REASON_CHARS = 120;
-export const MAX_CALL_VIDEO_BYTES_B64 = Math.ceil((128 * 1024 * 4) / 3) + 4;
+export const MAX_CALL_VIDEO_BYTES_B64 = Math.ceil((192 * 1024 * 4) / 3) + 4;
 export const MAX_CALL_AUDIO_BYTES_B64 = Math.ceil((16 * 1024 * 4) / 3) + 4;
 export const MAX_CALL_MEDIA_CT_CHARS = 384 * 1024;
 
@@ -221,6 +221,10 @@ function isValidSampleRate(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 8_000 && value <= 192_000;
 }
 
+function isValidAudioChannels(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= 2;
+}
+
 function isValidCallCodec(media: "audio" | "video", codec: unknown): codec is string {
   if (typeof codec !== "string" || codec.length === 0 || codec.length > 96) {
     return false;
@@ -368,7 +372,7 @@ export function validatePlainPayload(value: unknown, depth = 0): PlainPayload | 
         if (!isValidDimension(value.width) || !isValidDimension(value.height)) {
           return null;
         }
-      } else if (!isValidSampleRate(value.sampleRate) || !isValidDimension(value.numberOfChannels)) {
+      } else if (!isValidSampleRate(value.sampleRate) || !isValidAudioChannels(value.numberOfChannels)) {
         return null;
       }
       return isTimestamp(value.createdAt) ? (value as PlainPayload) : null;

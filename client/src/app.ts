@@ -85,6 +85,8 @@ type ChatMessage = {
 type CallMediaKind = "audio" | "video";
 type CallStatus = "incoming" | "outgoing" | "connecting" | "active";
 type CallDirection = "incoming" | "outgoing";
+type CallScope = "private" | "room";
+type CallParticipantStatus = "ringing" | "connecting" | "active" | "ended";
 type CallSignalPayload = Extract<
   PlainPayload,
   { type: "call-offer" | "call-answer" | "call-end" }
@@ -251,23 +253,45 @@ type EncodedCallReceiver = {
   seenAudioSeq: Set<number>;
 };
 
-type CallRuntime = {
-  callId: string;
+type CallParticipant = {
   peerId: string;
   peerName: string;
+  status: CallParticipantStatus;
+  receiver: EncodedCallReceiver;
+  remoteCanvas: HTMLCanvasElement | null;
+  audioLevel: number;
+  audioLevelAt: number;
+};
+
+type CallVideoProfile = {
+  width: number;
+  height: number;
+  fps: number;
+  bitrates: number[];
+};
+
+type CallRuntime = {
+  callId: string;
+  scope: CallScope;
+  peerId: string;
+  peerName: string;
+  targetIds: string[];
+  participants: Map<string, CallParticipant>;
   media: CallMediaKind;
   direction: CallDirection;
   status: CallStatus;
   localStream: MediaStream | null;
   publisher: EncodedCallPublisher | null;
-  receiver: EncodedCallReceiver;
-  remoteCanvas: HTMLCanvasElement | null;
   mediaSendFailures: number;
   mediaFailureNotified: boolean;
   incomingTimerId: number | null;
   ringtoneTimerId: number | null;
   muted: boolean;
   cameraOff: boolean;
+  localAudioLevel: number;
+  localAudioLevelAt: number;
+  audioIndicatorFrameId: number | null;
+  audioIndicatorDecayTimerId: number | null;
   createdAt: number;
 };
 
@@ -370,7 +394,7 @@ const DEFAULT_ROOM_NAME = "临时房间";
 const MEDIA_RATCHET_WINDOW = 1024;
 const MEDIA_MAX_SKIPPED_KEYS = 1024;
 const PEER_MAX_CALL_MEDIA_BYTES_PER_WINDOW = 12 * 1024 * 1024;
-const CALL_MAX_VIDEO_CHUNK_BYTES = 128 * 1024;
+const CALL_MAX_VIDEO_CHUNK_BYTES = 192 * 1024;
 const CALL_MAX_AUDIO_CHUNK_BYTES = 16 * 1024;
 const CALL_MAX_MEDIA_SEND_FAILURES = 8;
 const CALL_MAX_AUDIO_QUEUE_DELAY_SEC = 0.8;
@@ -378,7 +402,8 @@ const CALL_INCOMING_TIMEOUT_MS = 60_000;
 const CALL_RINGTONE_INTERVAL_MS = 1_700;
 const CALL_CONTROL_REPLAY_WINDOW = 256;
 const CALL_CONTROL_MAX_AGE_MS = 5 * 60 * 1000;
-const CALL_OFFER_COOLDOWN_MS = 30_000;
+const CALL_SPEAKING_LEVEL = 0.035;
+const CALL_SPEAKING_HOLD_MS = 620;
 const MAX_INLINE_IMAGE_BYTES = 3 * 1024 * 1024;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_FILE_BATCH = 10;
@@ -395,12 +420,21 @@ const DANGEROUS_DOWNLOAD_MIME_RE =
   /^(?:text\/html|text\/javascript|application\/(?:javascript|x-javascript|ecmascript|x-msdownload|x-sh|x-bat|x-csh)|image\/svg\+xml)$/u;
 const PEER_MAX_CALL_MEDIA_MESSAGES_PER_WINDOW = 2_000;
 const CALL_MEDIA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
+const CALL_MEDIA_BUFFER_CRITICAL_BYTES = 768 * 1024;
 const CALL_VIDEO_ENCODER_QUEUE_LIMIT = 2;
-const CALL_VIDEO_WIDTH = 640;
-const CALL_VIDEO_HEIGHT = 360;
-const CALL_VIDEO_FPS = 30;
-const CALL_VIDEO_BITRATE = 900_000;
-const CALL_VIDEO_BITRATES = [CALL_VIDEO_BITRATE, 700_000, 500_000];
+const CALL_MAX_ROOM_TARGETS = 8;
+const CALL_VIDEO_BASE_WIDTH = 640;
+const CALL_VIDEO_BASE_HEIGHT = 360;
+const CALL_VIDEO_BASE_FPS = 30;
+const CALL_VIDEO_BASE_BITRATES = [900_000, 700_000, 500_000];
+const CALL_VIDEO_ROOM_WIDTH = 480;
+const CALL_VIDEO_ROOM_HEIGHT = 270;
+const CALL_VIDEO_ROOM_FPS = 20;
+const CALL_VIDEO_ROOM_BITRATES = [520_000, 420_000, 320_000];
+const CALL_VIDEO_CROWDED_WIDTH = 360;
+const CALL_VIDEO_CROWDED_HEIGHT = 202;
+const CALL_VIDEO_CROWDED_FPS = 15;
+const CALL_VIDEO_CROWDED_BITRATES = [320_000, 260_000, 200_000];
 const CALL_VIDEO_HARDWARE_ACCELERATION: VideoEncoderConfigLike["hardwareAcceleration"][] = [
   "no-preference",
   "prefer-hardware",
@@ -862,16 +896,20 @@ async function processPendingRelays(): Promise<void> {
 }
 
 function shouldReceiveCallMediaEnvelope(state: Runtime, peer: PeerRuntime, envelope: RelayEnvelope): boolean {
+  if (envelope.kind !== "call-media") {
+    return true;
+  }
   const call = state.call;
-  return (
-    envelope.kind !== "call-media" ||
-    Boolean(call && call.status !== "incoming" && call.peerId === peer.clientId)
-  );
+  if (!call || call.status === "incoming") {
+    return false;
+  }
+  const participant = callParticipant(call, peer.clientId);
+  return Boolean(participant && participant.status !== "ended");
 }
 
 function shouldReceiveCallControlEnvelope(state: Runtime, peer: PeerRuntime, envelope: RelayEnvelope): boolean {
   const call = state.call;
-  return envelope.kind !== "call-control" || Boolean(call && call.peerId === peer.clientId);
+  return envelope.kind !== "call-control" || Boolean(call && callHasParticipant(call, peer.clientId));
 }
 
 function acceptPeerRate(peer: PeerRuntime, envelope: RelayEnvelope): boolean {
@@ -1246,11 +1284,15 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       state.pendingRelays.delete(clientId);
       state.privateUnread.delete(clientId);
       deleteIncomingFilesFromPeer(state, clientId);
-      if (state.call?.peerId === clientId) {
+      if (state.call && callHasParticipant(state.call, clientId)) {
         const activeCall = state.call;
-        state.call = null;
-        cleanupCall(activeCall);
-        addSystemMessage(`${peer.displayName} 已离开，通话已结束。`);
+        removeCallParticipant(activeCall, clientId);
+        addSystemMessage(`${peer.displayName} 已离开通话。`);
+        if (!hasLiveCallParticipants(activeCall)) {
+          state.call = null;
+          cleanupCall(activeCall);
+          addSystemMessage("通话已结束。");
+        }
       }
     }
   }
@@ -1873,7 +1915,7 @@ function sendCallEndSignal(
 }
 
 async function sendCallMedia(state: Runtime, peer: PeerRuntime, payload: CallMediaPayload): Promise<boolean> {
-  if (state.ws.bufferedAmount() > CALL_MEDIA_BUFFER_HIGH_WATER_BYTES) {
+  if (state.ws.bufferedAmount() > CALL_MEDIA_BUFFER_CRITICAL_BYTES) {
     return false;
   }
   const envelope = await sealPayload({
@@ -1886,6 +1928,23 @@ async function sendCallMedia(state: Runtime, peer: PeerRuntime, payload: CallMed
     payload
   });
   return state.ws.send(envelope);
+}
+
+async function sendCallMediaToActiveParticipants(
+  state: Runtime,
+  call: CallRuntime,
+  payload: CallMediaPayload
+): Promise<boolean> {
+  const targets = activeCallPeers(state, call);
+  if (targets.length === 0) {
+    return false;
+  }
+  let sent = false;
+  for (const peer of targets) {
+    const delivered = await sendCallMedia(state, peer, payload);
+    sent = sent || delivered;
+  }
+  return sent;
 }
 
 function webCodecsRuntime(): WebCodecsRuntime {
@@ -1904,6 +1963,215 @@ function createEncodedReceiver(): EncodedCallReceiver {
     seenVideoSeq: new Set(),
     seenAudioSeq: new Set()
   };
+}
+
+function createCallParticipant(peer: PeerRuntime, status: CallParticipantStatus): CallParticipant {
+  return {
+    peerId: peer.clientId,
+    peerName: peer.displayName,
+    status,
+    receiver: createEncodedReceiver(),
+    remoteCanvas: null,
+    audioLevel: 0,
+    audioLevelAt: 0
+  };
+}
+
+function ensureCallParticipant(
+  call: CallRuntime,
+  peer: PeerRuntime,
+  status: CallParticipantStatus
+): CallParticipant {
+  const existing = call.participants.get(peer.clientId);
+  if (existing) {
+    existing.peerName = peer.displayName;
+    if (participantStatusRank(status) >= participantStatusRank(existing.status)) {
+      existing.status = status;
+    }
+    return existing;
+  }
+  const participant = createCallParticipant(peer, status);
+  call.participants.set(peer.clientId, participant);
+  return participant;
+}
+
+function participantStatusRank(status: CallParticipantStatus): number {
+  if (status === "active") {
+    return 3;
+  }
+  if (status === "connecting") {
+    return 2;
+  }
+  if (status === "ringing") {
+    return 1;
+  }
+  return 0;
+}
+
+function callHasParticipant(call: CallRuntime, peerId: string): boolean {
+  return call.participants.has(peerId) || call.targetIds.includes(peerId) || call.peerId === peerId;
+}
+
+function callParticipant(call: CallRuntime, peerId: string): CallParticipant | null {
+  return call.participants.get(peerId) ?? null;
+}
+
+function callPeers(state: Runtime, call: CallRuntime): PeerRuntime[] {
+  const ids = new Set<string>([call.peerId, ...call.targetIds, ...call.participants.keys()]);
+  ids.delete(state.clientId);
+  return [...ids]
+    .map((peerId) => state.peers.get(peerId) ?? null)
+    .filter((peer): peer is PeerRuntime => Boolean(peer));
+}
+
+function activeCallPeers(state: Runtime, call: CallRuntime): PeerRuntime[] {
+  return [...call.participants.values()]
+    .filter((participant) => participant.status === "active")
+    .map((participant) => state.peers.get(participant.peerId) ?? null)
+    .filter((peer): peer is PeerRuntime => Boolean(peer));
+}
+
+function removeCallParticipant(call: CallRuntime, peerId: string): void {
+  const participant = call.participants.get(peerId);
+  if (!participant) {
+    return;
+  }
+  cleanupEncodedReceiver(participant.receiver);
+  participant.remoteCanvas = null;
+  call.participants.delete(peerId);
+}
+
+function hasLiveCallParticipants(call: CallRuntime): boolean {
+  return [...call.participants.values()].some((participant) => participant.status !== "ended");
+}
+
+function callVideoProfile(call: CallRuntime): CallVideoProfile {
+  const fanout = Math.max(1, call.participants.size || call.targetIds.length);
+  if (call.scope === "room" && fanout >= 5) {
+    return {
+      width: CALL_VIDEO_CROWDED_WIDTH,
+      height: CALL_VIDEO_CROWDED_HEIGHT,
+      fps: CALL_VIDEO_CROWDED_FPS,
+      bitrates: CALL_VIDEO_CROWDED_BITRATES
+    };
+  }
+  if (call.scope === "room" && fanout >= 3) {
+    return {
+      width: CALL_VIDEO_ROOM_WIDTH,
+      height: CALL_VIDEO_ROOM_HEIGHT,
+      fps: CALL_VIDEO_ROOM_FPS,
+      bitrates: CALL_VIDEO_ROOM_BITRATES
+    };
+  }
+  return {
+    width: CALL_VIDEO_BASE_WIDTH,
+    height: CALL_VIDEO_BASE_HEIGHT,
+    fps: CALL_VIDEO_BASE_FPS,
+    bitrates: CALL_VIDEO_BASE_BITRATES
+  };
+}
+
+function callFrameIntervalMs(state: Runtime, call: CallRuntime): number {
+  const profile = callVideoProfile(call);
+  const buffered = state.ws.bufferedAmount();
+  if (buffered > CALL_MEDIA_BUFFER_CRITICAL_BYTES) {
+    return Math.max(1000 / 10, 1000 / profile.fps);
+  }
+  if (buffered > CALL_MEDIA_BUFFER_HIGH_WATER_BYTES) {
+    return Math.max(1000 / 15, 1000 / profile.fps);
+  }
+  return 1000 / profile.fps;
+}
+
+function callQualityText(call: CallRuntime): string {
+  if (call.media !== "video") {
+    return "端到端加密语音流 · WebSocket 媒体中继";
+  }
+  const profile = call.publisher?.videoConfig ?? callVideoProfile(call);
+  const fps = "framerate" in profile ? profile.framerate : profile.fps;
+  return `端到端加密媒体流 · WebSocket 中继 · ${profile.width}x${profile.height} · ${fps}fps`;
+}
+
+function audioDataLevel(audioData: AudioDataLike): number {
+  const channels = Math.max(1, Math.min(audioData.numberOfChannels, 2));
+  let sum = 0;
+  let samples = 0;
+  for (let channel = 0; channel < channels; channel += 1) {
+    const target = new Float32Array(audioData.numberOfFrames);
+    try {
+      audioData.copyTo(target, { planeIndex: channel, format: "f32-planar" });
+    } catch {
+      audioData.copyTo(target, { planeIndex: channel });
+    }
+    const step = Math.max(1, Math.floor(target.length / 1024));
+    for (let index = 0; index < target.length; index += step) {
+      const value = target[index] ?? 0;
+      sum += value * value;
+      samples += 1;
+    }
+  }
+  return samples > 0 ? Math.sqrt(sum / samples) : 0;
+}
+
+function rememberCallAudioLevel(call: CallRuntime, speakerId: string, level: number): void {
+  const now = Date.now();
+  if (speakerId === "local") {
+    call.localAudioLevel = level;
+    call.localAudioLevelAt = now;
+  } else {
+    const participant = call.participants.get(speakerId);
+    if (!participant) {
+      return;
+    }
+    participant.audioLevel = level;
+    participant.audioLevelAt = now;
+  }
+  queueCallAudioIndicatorUpdate(call);
+}
+
+function queueCallAudioIndicatorUpdate(call: CallRuntime): void {
+  if (call.audioIndicatorFrameId === null) {
+    call.audioIndicatorFrameId = window.requestAnimationFrame(() => {
+      call.audioIndicatorFrameId = null;
+      updateCallAudioIndicators(call);
+    });
+  }
+  if (call.audioIndicatorDecayTimerId !== null) {
+    window.clearTimeout(call.audioIndicatorDecayTimerId);
+  }
+  call.audioIndicatorDecayTimerId = window.setTimeout(() => {
+    call.audioIndicatorDecayTimerId = null;
+    updateCallAudioIndicators(call);
+  }, CALL_SPEAKING_HOLD_MS + 80);
+}
+
+function callSpeakerLevel(call: CallRuntime, speakerId: string): number {
+  const now = Date.now();
+  if (speakerId === "local") {
+    return now - call.localAudioLevelAt <= CALL_SPEAKING_HOLD_MS ? call.localAudioLevel : 0;
+  }
+  const participant = call.participants.get(speakerId);
+  if (!participant || now - participant.audioLevelAt > CALL_SPEAKING_HOLD_MS) {
+    return 0;
+  }
+  return participant.audioLevel;
+}
+
+function updateCallAudioIndicators(call: CallRuntime): void {
+  const panel = document.querySelector<HTMLElement>(".call-panel");
+  if (!panel || runtime?.call !== call) {
+    return;
+  }
+  for (const node of panel.querySelectorAll<HTMLElement>("[data-speaker]")) {
+    const speakerId = node.dataset.speaker ?? "";
+    const level = callSpeakerLevel(call, speakerId);
+    const speaking = level >= CALL_SPEAKING_LEVEL;
+    const normalized = Math.min(1, Math.max(0, (level - CALL_SPEAKING_LEVEL) * 8));
+    node.classList.toggle("speaking", speaking);
+    node.style.setProperty("--voice-ring", `${Math.round(2 + normalized * 8)}px`);
+    node.style.setProperty("--voice-shift", `${Math.round(normalized * -3)}px`);
+    node.style.setProperty("--voice-scale", String(1 + normalized * 0.08));
+  }
 }
 
 async function callControlKey(peer: PeerRuntime): Promise<Uint8Array> {
@@ -1966,10 +2234,21 @@ function cleanupCall(call: CallRuntime | null): void {
   }
   call.localStream?.getTracks().forEach((track) => track.stop());
   call.localStream = null;
+  if (call.audioIndicatorFrameId !== null) {
+    window.cancelAnimationFrame(call.audioIndicatorFrameId);
+    call.audioIndicatorFrameId = null;
+  }
+  if (call.audioIndicatorDecayTimerId !== null) {
+    window.clearTimeout(call.audioIndicatorDecayTimerId);
+    call.audioIndicatorDecayTimerId = null;
+  }
   cleanupEncodedPublisher(call.publisher);
   call.publisher = null;
-  cleanupEncodedReceiver(call.receiver);
-  call.remoteCanvas = null;
+  for (const participant of call.participants.values()) {
+    cleanupEncodedReceiver(participant.receiver);
+    participant.remoteCanvas = null;
+  }
+  call.participants.clear();
 }
 
 function stopCallRingtone(call: CallRuntime): void {
@@ -2019,9 +2298,10 @@ function mediaLabel(media: CallMediaKind): string {
 
 function callVideoConstraints(): MediaTrackConstraints {
   return {
-    width: { ideal: CALL_VIDEO_WIDTH },
-    height: { ideal: CALL_VIDEO_HEIGHT },
-    frameRate: { ideal: CALL_VIDEO_FPS, max: CALL_VIDEO_FPS }
+    width: { ideal: CALL_VIDEO_BASE_WIDTH },
+    height: { ideal: CALL_VIDEO_BASE_HEIGHT },
+    aspectRatio: { ideal: 16 / 9 },
+    frameRate: { ideal: CALL_VIDEO_BASE_FPS, max: CALL_VIDEO_BASE_FPS }
   };
 }
 
@@ -2232,27 +2512,34 @@ function notifyIncomingCall(state: Runtime, call: CallRuntime, peer: PeerRuntime
   if (!state.notificationsEnabled || notificationPermission() !== "granted" || isWindowActive()) {
     return;
   }
-  const notification = new Notification(`${peer.displayName} 发起${mediaLabel(media)}通话`, {
+  const notification = new Notification(
+    call.scope === "room"
+      ? `${peer.displayName} 发起房间${mediaLabel(media)}通话`
+      : `${peer.displayName} 发起${mediaLabel(media)}通话`,
+    {
     body: "打开页面接听或拒绝",
     tag: `${state.room.roomId}:call:${peer.clientId}`
-  });
+    }
+  );
   notification.addEventListener("click", () => {
     window.focus();
     notification.close();
   });
 }
 
-function scheduleIncomingCallTimeout(state: Runtime, call: CallRuntime, peer: PeerRuntime): void {
+function scheduleIncomingCallTimeout(state: Runtime, call: CallRuntime, _peer: PeerRuntime): void {
   call.incomingTimerId = window.setTimeout(() => {
     if (runtime !== state || state.call !== call || call.status !== "incoming") {
       return;
     }
+    const notifyTargets = callAnswerTargets(state, call);
     state.call = null;
     cleanupCall(call);
-    rememberEndedCall(state, peer.clientId, call.callId);
     addSystemMessage("来电已超时。");
     renderChat();
-    sendCallEndSignal(state, peer, call.callId, "timeout");
+    for (const target of notifyTargets) {
+      sendCallEndSignal(state, target, call.callId, "timeout");
+    }
   }, CALL_INCOMING_TIMEOUT_MS);
 }
 
@@ -2275,6 +2562,30 @@ function canUseEncodedCall(media: CallMediaKind): boolean {
 }
 
 async function startPrivateCall(peer: PeerRuntime, media: CallMediaKind): Promise<void> {
+  await startOutgoingCall([peer], media, "private");
+}
+
+async function startRoomCall(media: CallMediaKind): Promise<void> {
+  const state = runtime;
+  if (!state) {
+    return;
+  }
+  const targets = [...state.peers.values()].slice(0, CALL_MAX_ROOM_TARGETS);
+  if (targets.length === 0) {
+    addSystemMessage("当前没有可呼叫的在线成员。");
+    return;
+  }
+  if (state.peers.size > CALL_MAX_ROOM_TARGETS) {
+    addSystemMessage(`房间通话暂时最多邀请 ${CALL_MAX_ROOM_TARGETS} 人，已邀请前 ${CALL_MAX_ROOM_TARGETS} 位在线成员。`);
+  }
+  await startOutgoingCall(targets, media, "room");
+}
+
+async function startOutgoingCall(
+  targets: PeerRuntime[],
+  media: CallMediaKind,
+  scope: CallScope
+): Promise<void> {
   const state = runtime;
   if (!state) {
     return;
@@ -2283,27 +2594,40 @@ async function startPrivateCall(peer: PeerRuntime, media: CallMediaKind): Promis
     addSystemMessage("当前已有通话，请先挂断。");
     return;
   }
+  if (targets.length === 0) {
+    addSystemMessage("当前没有可呼叫的在线成员。");
+    return;
+  }
+  const primary = targets[0]!;
   const call: CallRuntime = {
     callId: base64urlEncode(randomBytes(12)),
-    peerId: peer.clientId,
-    peerName: peer.displayName,
+    scope,
+    peerId: primary.clientId,
+    peerName: scope === "room" ? state.roomName : primary.displayName,
+    targetIds: targets.map((target) => target.clientId),
+    participants: new Map(),
     media,
     direction: "outgoing",
     status: "connecting",
     localStream: null,
     publisher: null,
-    receiver: createEncodedReceiver(),
-    remoteCanvas: null,
     mediaSendFailures: 0,
     mediaFailureNotified: false,
     incomingTimerId: null,
     ringtoneTimerId: null,
     muted: false,
     cameraOff: false,
+    localAudioLevel: 0,
+    localAudioLevelAt: 0,
+    audioIndicatorFrameId: null,
+    audioIndicatorDecayTimerId: null,
     createdAt: Date.now()
   };
+  for (const target of targets) {
+    ensureCallParticipant(call, target, "ringing");
+  }
   state.call = call;
-  state.privatePeerId = peer.clientId;
+  state.privatePeerId = scope === "private" ? primary.clientId : null;
   renderChat();
   try {
     const permissionNotice = await describeMediaPermissions(media);
@@ -2323,16 +2647,17 @@ async function startPrivateCall(peer: PeerRuntime, media: CallMediaKind): Promis
       throw new Error("当前浏览器不支持 WebCodecs 加密通话");
     }
     if (media === "video") {
-      await selectVideoConfig();
+      await selectVideoConfig(call);
     }
-    await sendCallSignal(state, peer, {
+    const offer: CallSignalPayload = {
       type: "call-offer",
       callId: call.callId,
       media,
       mode: "encoded-media",
-      targetIds: [peer.clientId],
+      targetIds: call.targetIds,
       createdAt: Date.now()
-    });
+    };
+    await Promise.all(targets.map((target) => sendCallSignal(state, target, offer)));
     call.status = "outgoing";
     renderChat();
   } catch (error) {
@@ -2343,6 +2668,14 @@ async function startPrivateCall(peer: PeerRuntime, media: CallMediaKind): Promis
     }
     addSystemMessage(await callFailureText("发起", media, error));
   }
+}
+
+function callAnswerTargets(state: Runtime, call: CallRuntime): PeerRuntime[] {
+  const ids = new Set<string>([call.peerId, ...call.targetIds]);
+  ids.delete(state.clientId);
+  return [...ids]
+    .map((peerId) => state.peers.get(peerId) ?? null)
+    .filter((peer): peer is PeerRuntime => Boolean(peer));
 }
 
 async function acceptIncomingCall(): Promise<void> {
@@ -2356,6 +2689,7 @@ async function acceptIncomingCall(): Promise<void> {
     await finishCall("对方已离线", false);
     return;
   }
+  ensureCallParticipant(call, peer, "connecting");
   call.status = "connecting";
   stopCallRingtone(call);
   if (call.incomingTimerId !== null) {
@@ -2381,16 +2715,18 @@ async function acceptIncomingCall(): Promise<void> {
       throw new Error("当前浏览器不支持 WebCodecs 加密通话");
     }
     if (call.media === "video") {
-      await selectVideoConfig();
+      await selectVideoConfig(call);
     }
-    await sendCallSignal(state, peer, {
+    const answer: CallSignalPayload = {
       type: "call-answer",
       callId: call.callId,
       mode: "encoded-media",
       createdAt: Date.now()
-    });
+    };
+    await Promise.all(callAnswerTargets(state, call).map((target) => sendCallSignal(state, target, answer)));
+    ensureCallParticipant(call, peer, "active");
     call.status = "active";
-    await startEncodedPublisher(state, call, peer);
+    await startEncodedPublisher(state, call);
     renderChat();
   } catch (error) {
     await finishCall("无法接听通话", true);
@@ -2404,11 +2740,14 @@ async function finishCall(reason = "ended", notifyPeer = true): Promise<void> {
   if (!state || !call) {
     return;
   }
-  const peer = callPeer(state, call);
-  if (peer && notifyPeer) {
-    sendCallEndSignal(state, peer, call.callId, reason);
-  } else if (peer) {
-    rememberEndedCall(state, peer.clientId, call.callId);
+  const outgoingReason =
+    call.scope === "room" && call.direction !== "outgoing" && reason === "ended" ? "left" : reason;
+  for (const peer of callPeers(state, call)) {
+    if (notifyPeer) {
+      sendCallEndSignal(state, peer, call.callId, outgoingReason);
+    } else {
+      rememberEndedCall(state, peer.clientId, call.callId);
+    }
   }
   state.call = null;
   cleanupCall(call);
@@ -2424,52 +2763,73 @@ async function handleCallSignal(
     if (hasEndedCall(state, peer.clientId, payload.callId)) {
       return;
     }
-    if (state.call?.callId === payload.callId && state.call.peerId === peer.clientId) {
+    if (state.call?.callId === payload.callId && callHasParticipant(state.call, peer.clientId)) {
       return;
     }
     if (state.call && state.call.callId !== payload.callId) {
       sendCallEndSignal(state, peer, payload.callId, "busy");
       return;
     }
-    const now = Date.now();
-    if (now - peer.lastIncomingCallOfferAt < CALL_OFFER_COOLDOWN_MS) {
-      sendCallEndSignal(state, peer, payload.callId, "busy");
-      return;
-    }
-    peer.lastIncomingCallOfferAt = now;
+    peer.lastIncomingCallOfferAt = Date.now();
     if (payload.targetIds && payload.targetIds.length > 0 && !payload.targetIds.includes(state.clientId)) {
       return;
     }
+    const targetIds = payload.targetIds && payload.targetIds.length > 0 ? payload.targetIds : [state.clientId];
+    const scope: CallScope = targetIds.length > 1 ? "room" : "private";
+    const participants = new Map<string, CallParticipant>();
+    const incomingParticipant = createCallParticipant(peer, "ringing");
+    participants.set(peer.clientId, incomingParticipant);
+    for (const targetId of targetIds) {
+      if (targetId === state.clientId || targetId === peer.clientId) {
+        continue;
+      }
+      const targetPeer = state.peers.get(targetId);
+      if (targetPeer) {
+        participants.set(targetPeer.clientId, createCallParticipant(targetPeer, "ringing"));
+      }
+    }
     state.call = {
       callId: payload.callId,
+      scope,
       peerId: peer.clientId,
-      peerName: peer.displayName,
+      peerName: scope === "room" ? state.roomName : peer.displayName,
+      targetIds,
+      participants,
       media: payload.media,
       direction: "incoming",
       status: "incoming",
       localStream: null,
       publisher: null,
-      receiver: createEncodedReceiver(),
-      remoteCanvas: null,
       mediaSendFailures: 0,
       mediaFailureNotified: false,
       incomingTimerId: null,
       ringtoneTimerId: null,
       muted: false,
       cameraOff: false,
+      localAudioLevel: 0,
+      localAudioLevelAt: 0,
+      audioIndicatorFrameId: null,
+      audioIndicatorDecayTimerId: null,
       createdAt: payload.createdAt
     };
-    state.privatePeerId = peer.clientId;
+    state.privatePeerId = scope === "private" ? peer.clientId : null;
     scheduleIncomingCallTimeout(state, state.call, peer);
     notifyIncomingCall(state, state.call, peer, payload.media);
-    addSystemMessage(`${peer.displayName} 发起${mediaLabel(payload.media)}通话。`);
+    addSystemMessage(
+      scope === "room"
+        ? `${peer.displayName} 发起房间${mediaLabel(payload.media)}通话。`
+        : `${peer.displayName} 发起${mediaLabel(payload.media)}通话。`
+    );
     renderChat();
     return;
   }
   const call = state.call;
   if (payload.type === "call-end") {
+    if (hasEndedCall(state, peer.clientId, payload.callId)) {
+      return;
+    }
     rememberEndedCall(state, peer.clientId, payload.callId);
-    if (!call || call.callId !== payload.callId || call.peerId !== peer.clientId) {
+    if (!call || call.callId !== payload.callId || !callHasParticipant(call, peer.clientId)) {
       return;
     }
     const message =
@@ -2478,50 +2838,75 @@ async function handleCallSignal(
         : payload.reason === "rejected"
           ? `${peer.displayName} 已拒绝通话。`
           : payload.reason === "timeout"
-            ? "通话未接听，已超时。"
-            : "通话已结束。";
-    cleanupCall(call);
-    state.call = null;
+            ? `${peer.displayName} 未接听，已超时。`
+            : payload.reason === "left"
+              ? `${peer.displayName} 已离开通话。`
+              : peer.clientId === call.peerId || call.scope === "private"
+                ? "通话已结束。"
+                : `${peer.displayName} 已离开通话。`;
+    removeCallParticipant(call, peer.clientId);
+    const endedWholeCall =
+      call.scope === "private" ||
+      peer.clientId === call.peerId ||
+      (payload.reason === "ended" && call.scope === "room" && peer.clientId === call.peerId);
+    if (endedWholeCall || !hasLiveCallParticipants(call)) {
+      cleanupCall(call);
+      state.call = null;
+    }
     addSystemMessage(message);
     renderChat();
     return;
   }
-  if (!call || call.callId !== payload.callId || call.peerId !== peer.clientId) {
+  if (!call || call.callId !== payload.callId || !callHasParticipant(call, peer.clientId)) {
     return;
   }
   if (payload.type === "call-answer") {
-    if (call.direction === "outgoing") {
+    if (hasEndedCall(state, peer.clientId, payload.callId)) {
+      return;
+    }
+    ensureCallParticipant(call, peer, "active");
+    if (call.status === "incoming") {
+      renderChat();
+      return;
+    }
+    if (!call.publisher && call.localStream) {
       try {
         call.status = "active";
-        await startEncodedPublisher(state, call, peer);
+        await startEncodedPublisher(state, call);
         renderChat();
       } catch {
         cleanupCall(call);
         state.call = null;
         renderChat();
         addSystemMessage("通话媒体启动失败，已结束通话。");
-        sendCallEndSignal(state, peer, call.callId, "media-failed");
+        for (const target of callPeers(state, call)) {
+          sendCallEndSignal(state, target, call.callId, "media-failed");
+        }
       }
+      return;
     }
+    call.status = "active";
+    renderChat();
     return;
   }
 }
 
-async function selectVideoConfig(): Promise<VideoEncoderConfigLike> {
+async function selectVideoConfig(call: CallRuntime): Promise<VideoEncoderConfigLike> {
   const codecs = webCodecsRuntime();
   const encoder = codecs.VideoEncoder;
   if (!encoder) {
     throw new Error("VideoEncoder unavailable");
   }
+  const profile = callVideoProfile(call);
   for (const codec of CALL_VIDEO_CODECS) {
     for (const hardwareAcceleration of CALL_VIDEO_HARDWARE_ACCELERATION) {
-      for (const bitrate of CALL_VIDEO_BITRATES) {
+      for (const bitrate of profile.bitrates) {
         const config: VideoEncoderConfigLike = {
           codec,
-          width: CALL_VIDEO_WIDTH,
-          height: CALL_VIDEO_HEIGHT,
+          width: profile.width,
+          height: profile.height,
           bitrate,
-          framerate: CALL_VIDEO_FPS,
+          framerate: profile.fps,
           latencyMode: "realtime",
           hardwareAcceleration
         };
@@ -2542,7 +2927,7 @@ async function selectVideoConfig(): Promise<VideoEncoderConfigLike> {
   throw new Error("No supported video encoder");
 }
 
-async function startEncodedPublisher(state: Runtime, call: CallRuntime, peer: PeerRuntime): Promise<void> {
+async function startEncodedPublisher(state: Runtime, call: CallRuntime): Promise<void> {
   if (call.publisher || !call.localStream) {
     return;
   }
@@ -2564,10 +2949,10 @@ async function startEncodedPublisher(state: Runtime, call: CallRuntime, peer: Pe
   call.publisher = publisher;
   let startedTrack = false;
   if (call.media === "video") {
-    await startEncodedVideo(state, call, peer, publisher);
+    await startEncodedVideo(state, call, publisher);
     startedTrack = true;
   }
-  const startedAudio = await startEncodedAudio(state, call, peer, publisher);
+  const startedAudio = await startEncodedAudio(state, call, publisher);
   startedTrack = startedTrack || startedAudio;
   if (!startedTrack) {
     cleanupEncodedPublisher(publisher);
@@ -2579,7 +2964,6 @@ async function startEncodedPublisher(state: Runtime, call: CallRuntime, peer: Pe
 async function startEncodedVideo(
   state: Runtime,
   call: CallRuntime,
-  peer: PeerRuntime,
   publisher: EncodedCallPublisher
 ): Promise<void> {
   const codecs = webCodecsRuntime();
@@ -2592,17 +2976,17 @@ async function startEncodedVideo(
   video.playsInline = true;
   await video.play();
   publisher.captureVideo = video;
+  publisher.videoConfig = await selectVideoConfig(call);
   const captureCanvas = document.createElement("canvas");
-  captureCanvas.width = CALL_VIDEO_WIDTH;
-  captureCanvas.height = CALL_VIDEO_HEIGHT;
+  captureCanvas.width = publisher.videoConfig.width;
+  captureCanvas.height = publisher.videoConfig.height;
   const captureContext = captureCanvas.getContext("2d", { alpha: false });
   if (!captureContext) {
     throw new Error("Canvas capture unavailable");
   }
-  publisher.videoConfig = await selectVideoConfig();
   publisher.videoEncoder = new codecs.VideoEncoder({
     output: (chunk) => {
-      void sendEncodedVideoChunk(state, call, peer, publisher, chunk);
+      void sendEncodedVideoChunk(state, call, publisher, chunk);
     },
     error: () => {
       if (runtime === state && state.call === call) {
@@ -2611,17 +2995,19 @@ async function startEncodedVideo(
     }
   });
   publisher.videoEncoder.configure(publisher.videoConfig);
+  const videoConfig = publisher.videoConfig;
   const encodeFrame = (now: number, metadata: { mediaTime?: number } | null) => {
     if (publisher.closed || runtime !== state || state.call !== call || !publisher.videoEncoder) {
       return;
     }
     const queueSize = publisher.videoEncoder.encodeQueueSize;
+    const buffered = state.ws.bufferedAmount();
     const congested =
       queueSize >= CALL_VIDEO_ENCODER_QUEUE_LIMIT ||
-      state.ws.bufferedAmount() > CALL_MEDIA_BUFFER_HIGH_WATER_BYTES;
+      buffered > CALL_MEDIA_BUFFER_CRITICAL_BYTES;
     const tooSoon =
       publisher.lastVideoEncodeAt > 0 &&
-      now - publisher.lastVideoEncodeAt < (1000 / CALL_VIDEO_FPS) * 0.75;
+      now - publisher.lastVideoEncodeAt < callFrameIntervalMs(state, call) * 0.75;
     if (!call.cameraOff && !congested && !tooSoon && video.readyState >= 2) {
       const timestamp = Math.round(
         metadata && Number.isFinite(metadata.mediaTime)
@@ -2633,7 +3019,7 @@ async function startEncodedVideo(
         if (!FrameCtor) {
           return;
         }
-        drawVideoContain(captureContext, video, CALL_VIDEO_WIDTH, CALL_VIDEO_HEIGHT);
+        drawVideoContain(captureContext, video, videoConfig.width, videoConfig.height);
         const frame = new FrameCtor(captureCanvas, { timestamp });
         const keyFrame =
           publisher.lastKeyFrameAt === 0 || now - publisher.lastKeyFrameAt >= CALL_KEYFRAME_INTERVAL_MS;
@@ -2653,19 +3039,27 @@ async function startEncodedVideo(
       publisher.videoCallbackId = video.requestVideoFrameCallback(encodeFrame);
     }
   };
-  if (video.requestVideoFrameCallback) {
+  const hasVideoFrameCallback = typeof video.requestVideoFrameCallback === "function";
+  if (hasVideoFrameCallback && video.requestVideoFrameCallback) {
     publisher.videoCallbackId = video.requestVideoFrameCallback(encodeFrame);
-  } else {
-    publisher.videoIntervalId = window.setInterval(() => {
-      encodeFrame(performance.now(), null);
-    }, Math.max(16, Math.round(1000 / CALL_VIDEO_FPS)));
   }
+  publisher.videoIntervalId = window.setInterval(
+    () => {
+      const now = performance.now();
+      const stale =
+        publisher.lastVideoEncodeAt === 0 ||
+        now - publisher.lastVideoEncodeAt > Math.max(260, callFrameIntervalMs(state, call) * 2.5);
+      if (!hasVideoFrameCallback || stale) {
+        encodeFrame(now, null);
+      }
+    },
+    hasVideoFrameCallback ? 250 : Math.max(16, Math.round(callFrameIntervalMs(state, call)))
+  );
 }
 
 async function sendEncodedVideoChunk(
   state: Runtime,
   call: CallRuntime,
-  peer: PeerRuntime,
   publisher: EncodedCallPublisher,
   chunk: EncodedChunkLike
 ): Promise<void> {
@@ -2676,9 +3070,10 @@ async function sendEncodedVideoChunk(
   chunk.copyTo(bytes);
   try {
     if (bytes.byteLength > CALL_MAX_VIDEO_CHUNK_BYTES) {
+      publisher.lastKeyFrameAt = 0;
       return;
     }
-    const sent = await sendCallMedia(state, peer, {
+    const sent = await sendCallMediaToActiveParticipants(state, call, {
       type: "call-media",
       callId: call.callId,
       media: "video",
@@ -2687,8 +3082,8 @@ async function sendEncodedVideoChunk(
       chunkType: chunk.type,
       timestamp: chunk.timestamp,
       duration: Number(chunk.duration ?? 0),
-      width: CALL_VIDEO_WIDTH,
-      height: CALL_VIDEO_HEIGHT,
+      width: publisher.videoConfig.width,
+      height: publisher.videoConfig.height,
       bytes: base64urlEncode(bytes),
       createdAt: Date.now()
     });
@@ -2708,7 +3103,6 @@ async function sendEncodedVideoChunk(
 async function startEncodedAudio(
   state: Runtime,
   call: CallRuntime,
-  peer: PeerRuntime,
   publisher: EncodedCallPublisher
 ): Promise<boolean> {
   const codecs = webCodecsRuntime();
@@ -2741,14 +3135,14 @@ async function startEncodedAudio(
     publisher.audioConfig = support.config ?? config;
     publisher.audioEncoder = new codecs.AudioEncoder({
       output: (chunk) => {
-        void sendEncodedAudioChunk(state, call, peer, publisher, chunk);
+        void sendEncodedAudioChunk(state, call, publisher, chunk);
       },
       error: () => undefined
     });
     publisher.audioEncoder.configure(publisher.audioConfig);
     const processor = new codecs.MediaStreamTrackProcessor({ track });
     publisher.audioReader = processor.readable.getReader();
-    void readEncodedAudioFrames(publisher);
+    void readEncodedAudioFrames(call, publisher);
     return true;
   } catch {
     publisher.audioEncoder = null;
@@ -2757,13 +3151,14 @@ async function startEncodedAudio(
   }
 }
 
-async function readEncodedAudioFrames(publisher: EncodedCallPublisher): Promise<void> {
+async function readEncodedAudioFrames(call: CallRuntime, publisher: EncodedCallPublisher): Promise<void> {
   while (!publisher.closed && publisher.audioReader && publisher.audioEncoder) {
     const next = await publisher.audioReader.read().catch(() => null);
     if (!next || next.done) {
       break;
     }
     const audioData = next.value;
+    rememberCallAudioLevel(call, "local", call.muted ? 0 : audioDataLevel(audioData));
     if (publisher.audioEncoder.encodeQueueSize < 8) {
       publisher.audioEncoder.encode(audioData);
     }
@@ -2774,7 +3169,6 @@ async function readEncodedAudioFrames(publisher: EncodedCallPublisher): Promise<
 async function sendEncodedAudioChunk(
   state: Runtime,
   call: CallRuntime,
-  peer: PeerRuntime,
   publisher: EncodedCallPublisher,
   chunk: EncodedChunkLike
 ): Promise<void> {
@@ -2787,7 +3181,7 @@ async function sendEncodedAudioChunk(
     if (bytes.byteLength > CALL_MAX_AUDIO_CHUNK_BYTES) {
       return;
     }
-    const sent = await sendCallMedia(state, peer, {
+    const sent = await sendCallMediaToActiveParticipants(state, call, {
       type: "call-media",
       callId: call.callId,
       media: "audio",
@@ -2890,28 +3284,37 @@ function trimSeenMediaSeq(seen: Set<number>, seq: number): boolean {
 
 function handleCallMedia(state: Runtime, peer: PeerRuntime, payload: CallMediaPayload): void {
   const call = state.call;
-  if (!call || call.callId !== payload.callId || call.peerId !== peer.clientId || call.status === "incoming") {
+  if (!call || call.callId !== payload.callId || call.status === "incoming") {
+    return;
+  }
+  const participant = callParticipant(call, peer.clientId);
+  if (!participant || participant.status !== "active") {
     return;
   }
   if (payload.media === "video") {
-    if (call.media !== "video" || !trimSeenMediaSeq(call.receiver.seenVideoSeq, payload.seq)) {
+    if (call.media !== "video" || !trimSeenMediaSeq(participant.receiver.seenVideoSeq, payload.seq)) {
       return;
     }
-    decodeCallVideo(state, call, payload);
+    decodeCallVideo(state, call, participant, payload);
     return;
   }
-  if (!trimSeenMediaSeq(call.receiver.seenAudioSeq, payload.seq)) {
+  if (!trimSeenMediaSeq(participant.receiver.seenAudioSeq, payload.seq)) {
     return;
   }
-  decodeCallAudio(call, payload);
+  decodeCallAudio(participant, payload);
 }
 
-function decodeCallVideo(state: Runtime, call: CallRuntime, payload: CallMediaPayload): void {
+function decodeCallVideo(
+  state: Runtime,
+  call: CallRuntime,
+  participant: CallParticipant,
+  payload: CallMediaPayload
+): void {
   const codecs = webCodecsRuntime();
   if (!codecs.VideoDecoder || !codecs.EncodedVideoChunk || !payload.width || !payload.height) {
     return;
   }
-  const receiver = call.receiver;
+  const receiver = participant.receiver;
   const configKey = `${payload.codec}:${payload.width}:${payload.height}`;
   try {
     if (!receiver.videoDecoder || receiver.videoConfigKey !== configKey) {
@@ -2919,7 +3322,7 @@ function decodeCallVideo(state: Runtime, call: CallRuntime, payload: CallMediaPa
       receiver.videoDecoder = new codecs.VideoDecoder({
         output: (frame) => {
           try {
-            drawDecodedVideoFrame(call, frame);
+            drawDecodedVideoFrame(participant, frame);
           } catch {
             frame.close();
           }
@@ -2974,14 +3377,14 @@ function decodeCallVideo(state: Runtime, call: CallRuntime, payload: CallMediaPa
   }
 }
 
-function drawDecodedVideoFrame(call: CallRuntime, frame: VideoFrameLike): void {
-  const canvas = call.remoteCanvas;
+function drawDecodedVideoFrame(participant: CallParticipant, frame: VideoFrameLike): void {
+  const canvas = participant.remoteCanvas;
   if (!canvas) {
     frame.close();
     return;
   }
-  const width = frame.displayWidth ?? frame.codedWidth ?? CALL_VIDEO_WIDTH;
-  const height = frame.displayHeight ?? frame.codedHeight ?? CALL_VIDEO_HEIGHT;
+  const width = frame.displayWidth ?? frame.codedWidth ?? CALL_VIDEO_BASE_WIDTH;
+  const height = frame.displayHeight ?? frame.codedHeight ?? CALL_VIDEO_BASE_HEIGHT;
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
@@ -2991,12 +3394,12 @@ function drawDecodedVideoFrame(call: CallRuntime, frame: VideoFrameLike): void {
   frame.close();
 }
 
-function decodeCallAudio(call: CallRuntime, payload: CallMediaPayload): void {
+function decodeCallAudio(participant: CallParticipant, payload: CallMediaPayload): void {
   const codecs = webCodecsRuntime();
   if (!codecs.AudioDecoder || !codecs.EncodedAudioChunk || !payload.sampleRate || !payload.numberOfChannels) {
     return;
   }
-  const receiver = call.receiver;
+  const receiver = participant.receiver;
   const configKey = `${payload.codec}:${payload.sampleRate}:${payload.numberOfChannels}`;
   try {
     if (!receiver.audioDecoder || receiver.audioConfigKey !== configKey) {
@@ -3004,7 +3407,7 @@ function decodeCallAudio(call: CallRuntime, payload: CallMediaPayload): void {
       receiver.audioDecoder = new codecs.AudioDecoder({
         output: (audioData) => {
           try {
-            playDecodedAudio(receiver, audioData);
+            playDecodedAudio(participant, audioData);
           } catch {
             audioData.close();
           }
@@ -3042,7 +3445,8 @@ function decodeCallAudio(call: CallRuntime, payload: CallMediaPayload): void {
   }
 }
 
-function playDecodedAudio(receiver: EncodedCallReceiver, audioData: AudioDataLike): void {
+function playDecodedAudio(participant: CallParticipant, audioData: AudioDataLike): void {
+  const receiver = participant.receiver;
   const AudioContextCtor = window.AudioContext;
   if (!AudioContextCtor) {
     audioData.close();
@@ -3055,10 +3459,26 @@ function playDecodedAudio(receiver: EncodedCallReceiver, audioData: AudioDataLik
   const context = receiver.audioContext;
   const channels = Math.max(1, Math.min(audioData.numberOfChannels, 2));
   const buffer = context.createBuffer(channels, audioData.numberOfFrames, audioData.sampleRate);
+  let sum = 0;
+  let samples = 0;
   for (let channel = 0; channel < channels; channel += 1) {
     const target = new Float32Array(audioData.numberOfFrames);
-    audioData.copyTo(target, { planeIndex: channel, format: "f32-planar" });
+    try {
+      audioData.copyTo(target, { planeIndex: channel, format: "f32-planar" });
+    } catch {
+      audioData.copyTo(target, { planeIndex: channel });
+    }
+    const step = Math.max(1, Math.floor(target.length / 1024));
+    for (let index = 0; index < target.length; index += step) {
+      const value = target[index] ?? 0;
+      sum += value * value;
+      samples += 1;
+    }
     buffer.copyToChannel(target, channel);
+  }
+  const currentCall = runtime?.call;
+  if (currentCall?.participants.get(participant.peerId) === participant) {
+    rememberCallAudioLevel(currentCall, participant.peerId, samples > 0 ? Math.sqrt(sum / samples) : 0);
   }
   const source = context.createBufferSource();
   source.buffer = buffer;
@@ -3359,7 +3779,31 @@ function renderTopbar(state: Runtime, privatePeer: PeerRuntime | null): HTMLElem
     void enableRoomNotifications();
   });
   actions.push(notifications);
-  if (privatePeer) {
+  if (!privatePeer) {
+    const roomAudioCall = el("button", {
+      className: "secondary call-action",
+      text: "房间语音",
+      title: "发起房间语音通话",
+      ariaLabel: "发起房间语音通话",
+      disabled: Boolean(state.call) || state.peers.size === 0
+    });
+    roomAudioCall.type = "button";
+    roomAudioCall.addEventListener("click", () => {
+      void startRoomCall("audio");
+    });
+    const roomVideoCall = el("button", {
+      className: "secondary call-action",
+      text: "房间视频",
+      title: "发起房间视频通话",
+      ariaLabel: "发起房间视频通话",
+      disabled: Boolean(state.call) || state.peers.size === 0
+    });
+    roomVideoCall.type = "button";
+    roomVideoCall.addEventListener("click", () => {
+      void startRoomCall("video");
+    });
+    actions.push(roomAudioCall, roomVideoCall);
+  } else {
     const audioCall = el("button", {
       className: "secondary call-action",
       text: "语音",
@@ -3681,36 +4125,78 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
     return null;
   }
   const isIncoming = call.status === "incoming";
-  const panel = el("section", { className: ["call-panel", call.media].join(" ") });
-  const title = `${call.peerName} · ${mediaLabel(call.media)}${CALL_STATUS_TEXT[call.status]}`;
+  const panel = el("section", { className: ["call-panel", call.media, call.scope].join(" ") });
+  const liveCount = [...call.participants.values()].filter((participant) => participant.status === "active").length;
+  const participantCount = call.participants.size;
+  const title =
+    call.scope === "room"
+      ? `${state.roomName} · 房间${mediaLabel(call.media)}${CALL_STATUS_TEXT[call.status]}`
+      : `${call.peerName} · ${mediaLabel(call.media)}${CALL_STATUS_TEXT[call.status]}`;
   const status = el("div", { className: "call-status" }, [
     el("div", { className: "call-avatar", text: avatarText(call.peerName) }),
     el("div", { className: "call-text" }, [
       el("div", { className: "call-title", text: title }),
       el("div", {
         className: "call-subtitle",
-        text:
-          call.media === "video"
-            ? `端到端加密媒体流 · ${CALL_VIDEO_WIDTH}x${CALL_VIDEO_HEIGHT} · ${CALL_VIDEO_FPS}fps`
-            : "端到端加密语音流"
+        text: `${callQualityText(call)} · ${liveCount}/${participantCount || 1} 人已接入`
       })
     ])
   ]);
   const mediaStage = el("div", { className: "call-stage" });
+  const remoteGrid = el("div", { className: "call-remote-grid" });
+  const participants = [...call.participants.values()];
   if (call.media === "video") {
-    const canvas = el("canvas", { className: "call-remote-media call-remote-canvas" }) as HTMLCanvasElement;
-    canvas.width = CALL_VIDEO_WIDTH;
-    canvas.height = CALL_VIDEO_HEIGHT;
-    call.remoteCanvas = canvas;
-    mediaStage.append(canvas);
-    if (!call.receiver.gotVideoKeyFrame) {
-      mediaStage.append(el("div", { className: "call-waiting", text: CALL_STATUS_TEXT[call.status] }));
+    for (const participant of participants) {
+      const tile = el("div", { className: "call-remote-tile" });
+      setDataset(tile, "speaker", participant.peerId);
+      const profile = call.publisher?.videoConfig ?? callVideoProfile(call);
+      const canvas = el("canvas", { className: "call-remote-media call-remote-canvas" }) as HTMLCanvasElement;
+      canvas.width = profile.width;
+      canvas.height = profile.height;
+      participant.remoteCanvas = canvas;
+      tile.append(canvas, el("div", { className: "call-participant-name", text: participant.peerName }));
+      if (!participant.receiver.gotVideoKeyFrame) {
+        tile.append(el("div", { className: "call-waiting", text: participant.status === "active" ? "等待画面" : "等待接听" }));
+      }
+      remoteGrid.append(tile);
     }
   } else {
-    mediaStage.append(el("div", { className: "call-waiting", text: CALL_STATUS_TEXT[call.status] }));
+    if (call.localStream || call.status === "active" || call.status === "connecting") {
+      const selfCard = el("div", { className: "call-audio-peer self active" }, [
+        el("div", { className: "call-audio-avatar", text: avatarText(state.displayName) }),
+        el("div", { className: "call-audio-name", text: "我" }),
+        el("div", {
+          className: "call-audio-state",
+          text: call.muted ? "已静音" : "已接入"
+        })
+      ]);
+      setDataset(selfCard, "speaker", "local");
+      remoteGrid.append(selfCard);
+    }
+    for (const participant of participants) {
+      const card = el("div", { className: ["call-audio-peer", participant.status].join(" ") }, [
+        el("div", { className: "call-audio-avatar", text: avatarText(participant.peerName) }),
+        el("div", { className: "call-audio-name", text: participant.peerName }),
+        el("div", {
+          className: "call-audio-state",
+          text: participant.status === "active" ? "已接入" : participant.status === "ended" ? "已离开" : "等待接听"
+        })
+      ]);
+      setDataset(card, "speaker", participant.peerId);
+      remoteGrid.append(card);
+    }
   }
-  if (call.localStream && call.localStream.getTracks().length > 0) {
-    mediaStage.append(renderMediaElement(call.localStream, "call-local-media", true));
+  if (!remoteGrid.hasChildNodes()) {
+    remoteGrid.append(el("div", { className: "call-waiting", text: CALL_STATUS_TEXT[call.status] }));
+  }
+  mediaStage.append(remoteGrid);
+  if (call.media === "video" && call.localStream && call.localStream.getVideoTracks().length > 0) {
+    const localWrap = el("div", { className: "call-local-wrap" }, [
+      renderMediaElement(call.localStream, "call-local-media", true),
+      el("span", { className: "call-local-label", text: "我" })
+    ]);
+    setDataset(localWrap, "speaker", "local");
+    mediaStage.append(localWrap);
   }
   const actions = el("div", { className: "call-controls" });
   if (isIncoming) {
@@ -3755,7 +4241,9 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
       });
       actions.append(camera);
     }
-    const hangup = el("button", { className: "call-control end", text: "挂断" });
+    const hangupText =
+      call.scope === "room" ? (call.direction === "outgoing" ? "结束通话" : "离开") : "挂断";
+    const hangup = el("button", { className: "call-control end", text: hangupText });
     hangup.type = "button";
     hangup.addEventListener("click", () => {
       void finishCall("ended", true);
@@ -3763,6 +4251,11 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
     actions.append(hangup);
   }
   panel.append(status, mediaStage, actions);
+  window.requestAnimationFrame(() => {
+    if (runtime?.call === call) {
+      updateCallAudioIndicators(call);
+    }
+  });
   return panel;
 }
 
