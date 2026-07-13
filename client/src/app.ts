@@ -2424,6 +2424,30 @@ function drawVideoContain(
   context.drawImage(video, 0, 0, sourceWidth, sourceHeight, targetX, targetY, targetWidth, targetHeight);
 }
 
+function drawCameraOffFrame(context: CanvasRenderingContext2D, width: number, height: number): void {
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const radius = Math.max(18, Math.min(width, height) * 0.15);
+  context.fillStyle = "#0f172a";
+  context.fillRect(0, 0, width, height);
+  context.fillStyle = "#1e293b";
+  context.beginPath();
+  context.arc(centerX, centerY - radius * 0.35, radius, 0, Math.PI * 2);
+  context.fill();
+  context.strokeStyle = "#94a3b8";
+  context.lineWidth = Math.max(4, radius * 0.12);
+  context.lineCap = "round";
+  context.beginPath();
+  context.moveTo(centerX - radius * 0.65, centerY + radius * 0.3);
+  context.lineTo(centerX + radius * 0.65, centerY - radius);
+  context.stroke();
+  context.fillStyle = "#cbd5e1";
+  context.font = `600 ${Math.max(14, Math.round(height * 0.06))}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText("摄像头已关闭", centerX, centerY + radius * 1.3);
+}
+
 function isNotAllowedMediaError(error: unknown): boolean {
   return (
     typeof error === "object" &&
@@ -3005,12 +3029,14 @@ async function startEncodedVideo(
     const congested =
       queueSize >= CALL_VIDEO_ENCODER_QUEUE_LIMIT ||
       buffered > CALL_MEDIA_BUFFER_CRITICAL_BYTES;
+    const targetFrameIntervalMs = call.cameraOff ? 1_000 : callFrameIntervalMs(state, call);
     const tooSoon =
       publisher.lastVideoEncodeAt > 0 &&
-      now - publisher.lastVideoEncodeAt < callFrameIntervalMs(state, call) * 0.75;
-    if (!call.cameraOff && !congested && !tooSoon && video.readyState >= 2) {
+      now - publisher.lastVideoEncodeAt < targetFrameIntervalMs * 0.75;
+    const canDrawCamera = !call.cameraOff && video.readyState >= 2;
+    if (!congested && !tooSoon && (call.cameraOff || canDrawCamera)) {
       const timestamp = Math.round(
-        metadata && Number.isFinite(metadata.mediaTime)
+        !call.cameraOff && metadata && Number.isFinite(metadata.mediaTime)
           ? (metadata.mediaTime ?? 0) * 1_000_000
           : performance.now() * 1_000
       );
@@ -3019,9 +3045,14 @@ async function startEncodedVideo(
         if (!FrameCtor) {
           return;
         }
-        drawVideoContain(captureContext, video, videoConfig.width, videoConfig.height);
+        if (call.cameraOff) {
+          drawCameraOffFrame(captureContext, videoConfig.width, videoConfig.height);
+        } else {
+          drawVideoContain(captureContext, video, videoConfig.width, videoConfig.height);
+        }
         const frame = new FrameCtor(captureCanvas, { timestamp });
         const keyFrame =
+          call.cameraOff ||
           publisher.lastKeyFrameAt === 0 || now - publisher.lastKeyFrameAt >= CALL_KEYFRAME_INTERVAL_MS;
         publisher.videoEncoder.encode(frame, { keyFrame });
         frame.close();
@@ -3046,9 +3077,13 @@ async function startEncodedVideo(
   publisher.videoIntervalId = window.setInterval(
     () => {
       const now = performance.now();
+      const targetFrameIntervalMs = call.cameraOff ? 1_000 : callFrameIntervalMs(state, call);
+      const staleLimitMs = call.cameraOff
+        ? Math.max(260, targetFrameIntervalMs * 0.9)
+        : Math.max(260, targetFrameIntervalMs * 2.5);
       const stale =
         publisher.lastVideoEncodeAt === 0 ||
-        now - publisher.lastVideoEncodeAt > Math.max(260, callFrameIntervalMs(state, call) * 2.5);
+        now - publisher.lastVideoEncodeAt > staleLimitMs;
       if (!hasVideoFrameCallback || stale) {
         encodeFrame(now, null);
       }
@@ -4232,8 +4267,9 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
         call.localStream?.getVideoTracks().forEach((track) => {
           track.enabled = !call.cameraOff;
         });
-        if (!call.cameraOff && call.publisher) {
+        if (call.publisher) {
           call.publisher.lastKeyFrameAt = 0;
+          call.publisher.lastVideoEncodeAt = 0;
         }
         if (event.currentTarget instanceof HTMLButtonElement) {
           event.currentTarget.textContent = call.cameraOff ? "开镜头" : "关镜头";
