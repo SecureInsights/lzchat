@@ -358,6 +358,19 @@ type Runtime = {
   lastNotificationAt: number;
 };
 
+type RenderChatOptions = {
+  forceScrollToBottom?: boolean;
+};
+
+type ComposerSnapshot = {
+  value: string;
+  draftText: string;
+  wasFocused: boolean;
+  selectionStart: number;
+  selectionEnd: number;
+  selectionDirection: HTMLTextAreaElement["selectionDirection"];
+};
+
 type DeliveryContext = {
   targets: PeerRuntime[];
   scope: "room" | "private";
@@ -823,6 +836,42 @@ function parseInviteInput(value: string): string {
 function setApp(node: Node): void {
   removeChildren(appRoot);
   appRoot.append(node);
+}
+
+function captureComposerSnapshot(state: Runtime): ComposerSnapshot | null {
+  const input = appRoot.querySelector<HTMLTextAreaElement>(".composer-input");
+  if (!input) {
+    return null;
+  }
+  return {
+    value: input.value,
+    draftText: state.draftText,
+    wasFocused: document.activeElement === input,
+    selectionStart: input.selectionStart,
+    selectionEnd: input.selectionEnd,
+    selectionDirection: input.selectionDirection
+  };
+}
+
+function restoreComposerSnapshot(snapshot: ComposerSnapshot | null): void {
+  if (!snapshot?.wasFocused) {
+    return;
+  }
+  const input = appRoot.querySelector<HTMLTextAreaElement>(".composer-input");
+  if (!input) {
+    return;
+  }
+  if (snapshot.value === snapshot.draftText && input.value !== snapshot.value) {
+    input.value = snapshot.value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  input.focus();
+  const end = input.value.length;
+  input.setSelectionRange(
+    Math.min(snapshot.selectionStart, end),
+    Math.min(snapshot.selectionEnd, end),
+    snapshot.selectionDirection
+  );
 }
 
 function pushMessage(state: Runtime, message: ChatMessage): void {
@@ -3863,7 +3912,7 @@ async function sendTextMessage(text: string): Promise<void> {
     return;
   }
   pushMessage(state, ownMessage);
-  renderChat();
+  renderChat({ forceScrollToBottom: true });
 }
 
 async function sendImageBlob(blob: Blob, fallbackName: string): Promise<void> {
@@ -3913,7 +3962,7 @@ async function sendImageBlob(blob: Blob, fallbackName: string): Promise<void> {
       throw new Error("send_failed");
     }
     pushMessage(state, ownMessage);
-    renderChat();
+    renderChat({ forceScrollToBottom: true });
   } catch (error) {
     revokeMessageResources(ownMessage);
     addSystemMessage(error instanceof Error ? "图片发送失败。" : "图片发送失败。");
@@ -4013,7 +4062,7 @@ async function sendAttachmentFile(file: File): Promise<void> {
     ownMessage.peerName = delivery.peerName;
   }
   pushMessage(state, ownMessage);
-  renderChat();
+  renderChat({ forceScrollToBottom: true });
 }
 
 async function sendFiles(files: readonly File[]): Promise<void> {
@@ -4670,14 +4719,16 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
   return panel;
 }
 
-function renderChat(): void {
+function renderChat(options: RenderChatOptions = {}): void {
   const state = runtime;
   if (!state) {
     renderLogin();
     return;
   }
+  const composerSnapshot = captureComposerSnapshot(state);
   const previousMessages = appRoot.querySelector<HTMLElement>(".messages");
   const shouldStickToBottom =
+    options.forceScrollToBottom ||
     !previousMessages ||
     previousMessages.scrollHeight - previousMessages.scrollTop - previousMessages.clientHeight < 96;
   const privatePeer = state.privatePeerId ? (state.peers.get(state.privatePeerId) ?? null) : null;
@@ -4699,6 +4750,7 @@ function renderChat(): void {
   if (shouldStickToBottom) {
     messages.scrollTop = messages.scrollHeight;
   }
+  restoreComposerSnapshot(composerSnapshot);
 }
 
 function showInviteDialog(
