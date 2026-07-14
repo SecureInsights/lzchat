@@ -66,6 +66,10 @@ type PeerRuntime = {
   lastFailureNoticeAt: number;
 };
 
+type InvalidPeerNotice = {
+  seenAt: number;
+};
+
 type ChatMessage = {
   id: string;
   own: boolean;
@@ -87,10 +91,7 @@ type CallStatus = "incoming" | "outgoing" | "connecting" | "active";
 type CallDirection = "incoming" | "outgoing";
 type CallScope = "private" | "room";
 type CallParticipantStatus = "ringing" | "connecting" | "active" | "ended";
-type CallSignalPayload = Extract<
-  PlainPayload,
-  { type: "call-offer" | "call-answer" | "call-end" }
->;
+type CallSignalPayload = Extract<PlainPayload, { type: "call-offer" | "call-answer" | "call-end" }>;
 type CallEndPayload = Extract<PlainPayload, { type: "call-end" }>;
 type CallMediaPayload = Extract<PlainPayload, { type: "call-media" }>;
 type CallControlPayload = CallEndPayload;
@@ -178,21 +179,37 @@ type AudioDecoderLike = {
 };
 
 type VideoEncoderConstructorLike = {
-  new (init: { output: (chunk: EncodedChunkLike) => void; error: (error: Error) => void }): VideoEncoderLike;
-  isConfigSupported?: (config: VideoEncoderConfigLike) => Promise<{ supported: boolean; config?: VideoEncoderConfigLike }>;
+  new (init: {
+    output: (chunk: EncodedChunkLike) => void;
+    error: (error: Error) => void;
+  }): VideoEncoderLike;
+  isConfigSupported?: (
+    config: VideoEncoderConfigLike
+  ) => Promise<{ supported: boolean; config?: VideoEncoderConfigLike }>;
 };
 
 type AudioEncoderConstructorLike = {
-  new (init: { output: (chunk: EncodedChunkLike) => void; error: (error: Error) => void }): AudioEncoderLike;
-  isConfigSupported?: (config: AudioEncoderConfigLike) => Promise<{ supported: boolean; config?: AudioEncoderConfigLike }>;
+  new (init: {
+    output: (chunk: EncodedChunkLike) => void;
+    error: (error: Error) => void;
+  }): AudioEncoderLike;
+  isConfigSupported?: (
+    config: AudioEncoderConfigLike
+  ) => Promise<{ supported: boolean; config?: AudioEncoderConfigLike }>;
 };
 
 type VideoDecoderConstructorLike = {
-  new (init: { output: (frame: VideoFrameLike) => void; error: (error: Error) => void }): VideoDecoderLike;
+  new (init: {
+    output: (frame: VideoFrameLike) => void;
+    error: (error: Error) => void;
+  }): VideoDecoderLike;
 };
 
 type AudioDecoderConstructorLike = {
-  new (init: { output: (data: AudioDataLike) => void; error: (error: Error) => void }): AudioDecoderLike;
+  new (init: {
+    output: (data: AudioDataLike) => void;
+    error: (error: Error) => void;
+  }): AudioDecoderLike;
 };
 
 type VideoFrameConstructorLike = {
@@ -200,7 +217,12 @@ type VideoFrameConstructorLike = {
 };
 
 type EncodedVideoChunkConstructorLike = {
-  new (init: { type: EncodedChunkType; timestamp: number; duration?: number; data: Uint8Array }): EncodedChunkLike;
+  new (init: {
+    type: EncodedChunkType;
+    timestamp: number;
+    duration?: number;
+    data: Uint8Array;
+  }): EncodedChunkLike;
 };
 
 type EncodedAudioChunkConstructorLike = EncodedVideoChunkConstructorLike;
@@ -210,7 +232,9 @@ type MediaStreamTrackProcessorConstructorLike = {
 };
 
 type CaptureVideoElement = HTMLVideoElement & {
-  requestVideoFrameCallback?: (callback: (now: number, metadata: { mediaTime?: number }) => void) => number;
+  requestVideoFrameCallback?: (
+    callback: (now: number, metadata: { mediaTime?: number }) => void
+  ) => number;
   cancelVideoFrameCallback?: (handle: number) => void;
 };
 
@@ -321,10 +345,12 @@ type Runtime = {
   privatePeerId: string | null;
   roomUnread: number;
   privateUnread: Map<string, number>;
+  draftText: string;
   inviteLink: string | null;
   invitePassphrase: string;
   inviteMode: "single-link" | "two-channel";
   incomingFiles: Map<string, IncomingFile>;
+  invalidPeerNotices: Map<string, InvalidPeerNotice>;
   call: CallRuntime | null;
   endedCalls: Map<string, number>;
   notificationsEnabled: boolean;
@@ -389,6 +415,7 @@ const PEER_MAX_MESSAGES_PER_WINDOW = 120;
 const FAILURE_NOTICE_INTERVAL_MS = 5_000;
 const NOTIFICATION_THROTTLE_MS = 900;
 const MAX_PENDING_RELAYS_PER_PEER = 32;
+const INVALID_PEER_NOTICE_MS = 60_000;
 const MAX_ROOM_NAME_CHARS = 60;
 const DEFAULT_ROOM_NAME = "临时房间";
 const MEDIA_RATCHET_WINDOW = 1024;
@@ -496,7 +523,9 @@ function isWindowActive(): boolean {
   return document.visibilityState === "visible" && document.hasFocus();
 }
 
-async function requestDesktopNotificationPermission(): Promise<NotificationPermission | "unsupported"> {
+async function requestDesktopNotificationPermission(): Promise<
+  NotificationPermission | "unsupported"
+> {
   if (!("Notification" in window)) {
     return "unsupported";
   }
@@ -879,6 +908,15 @@ function queuePendingRelay(state: Runtime, envelope: RelayEnvelope): void {
   state.pendingRelays.set(envelope.from, queued);
 }
 
+function noteInvalidPeerKey(state: Runtime, clientId: string): void {
+  const now = Date.now();
+  const last = state.invalidPeerNotices.get(clientId)?.seenAt ?? 0;
+  state.invalidPeerNotices.set(clientId, { seenAt: now });
+  if (now - last > INVALID_PEER_NOTICE_MS) {
+    addSystemMessage("有成员使用了无效的临时公钥，已跳过该成员。");
+  }
+}
+
 async function processPendingRelays(): Promise<void> {
   const state = runtime;
   if (!state) {
@@ -895,7 +933,11 @@ async function processPendingRelays(): Promise<void> {
   }
 }
 
-function shouldReceiveCallMediaEnvelope(state: Runtime, peer: PeerRuntime, envelope: RelayEnvelope): boolean {
+function shouldReceiveCallMediaEnvelope(
+  state: Runtime,
+  peer: PeerRuntime,
+  envelope: RelayEnvelope
+): boolean {
   if (envelope.kind !== "call-media") {
     return true;
   }
@@ -907,17 +949,27 @@ function shouldReceiveCallMediaEnvelope(state: Runtime, peer: PeerRuntime, envel
   return Boolean(participant && participant.status !== "ended");
 }
 
-function shouldReceiveCallControlEnvelope(state: Runtime, peer: PeerRuntime, envelope: RelayEnvelope): boolean {
+function shouldReceiveCallControlEnvelope(
+  state: Runtime,
+  peer: PeerRuntime,
+  envelope: RelayEnvelope
+): boolean {
   const call = state.call;
-  return envelope.kind !== "call-control" || Boolean(call && callHasParticipant(call, peer.clientId));
+  return (
+    envelope.kind !== "call-control" || Boolean(call && callHasParticipant(call, peer.clientId))
+  );
 }
 
 function acceptPeerRate(peer: PeerRuntime, envelope: RelayEnvelope): boolean {
   const now = Date.now();
   if (envelope.kind === "call-media") {
-    peer.mediaMessageWindow = peer.mediaMessageWindow.filter((seen) => now - seen < PEER_MESSAGE_WINDOW_MS);
+    peer.mediaMessageWindow = peer.mediaMessageWindow.filter(
+      (seen) => now - seen < PEER_MESSAGE_WINDOW_MS
+    );
     peer.mediaMessageWindow.push(now);
-    peer.mediaByteWindow = peer.mediaByteWindow.filter((item) => now - item.seenAt < PEER_MESSAGE_WINDOW_MS);
+    peer.mediaByteWindow = peer.mediaByteWindow.filter(
+      (item) => now - item.seenAt < PEER_MESSAGE_WINDOW_MS
+    );
     peer.mediaByteWindow.push({ seenAt: now, bytes: envelope.ct.length });
     const mediaBytes = peer.mediaByteWindow.reduce((sum, item) => sum + item.bytes, 0);
     if (mediaBytes > PEER_MAX_CALL_MEDIA_BYTES_PER_WINDOW) {
@@ -966,7 +1018,10 @@ function pruneIncomingFiles(state: Runtime): void {
   }
 }
 
-function incomingFileStats(state: Runtime, peerId?: string): { files: number; reservedBytes: number; bufferedBytes: number } {
+function incomingFileStats(
+  state: Runtime,
+  peerId?: string
+): { files: number; reservedBytes: number; bufferedBytes: number } {
   let files = 0;
   let reservedBytes = 0;
   let bufferedBytes = 0;
@@ -1240,10 +1295,12 @@ async function startRoom(input: {
     privatePeerId: null,
     roomUnread: 0,
     privateUnread: new Map(),
+    draftText: "",
     inviteLink: input.inviteLink ?? null,
     invitePassphrase: input.invitePassphrase ?? "",
     inviteMode: input.mode,
     call: null,
+    invalidPeerNotices: new Map(),
     endedCalls: new Map(),
     notificationsEnabled: notificationPermission() === "granted",
     soundEnabled: soundReady,
@@ -1314,20 +1371,30 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     if (existing) {
       destroyPeer(existing);
     }
-    const pair = await derivePairSession({
-      roomId: state.room.roomId,
-      roomPsk: state.room.roomPsk,
-      localPrivateKey: state.session.privateKey,
-      localClientId: state.clientId,
-      localSessionPub: state.session.publicKeyToken,
-      peerClientId: member.clientId,
-      peerSessionPub: member.sessionPub,
-      capabilities: state.capabilities
-    });
+    let pair: PairSession;
+    try {
+      pair = await derivePairSession({
+        roomId: state.room.roomId,
+        roomPsk: state.room.roomPsk,
+        localPrivateKey: state.session.privateKey,
+        localClientId: state.clientId,
+        localSessionPub: state.session.publicKeyToken,
+        peerClientId: member.clientId,
+        peerSessionPub: member.sessionPub,
+        capabilities: state.capabilities
+      });
+    } catch {
+      noteInvalidPeerKey(state, member.clientId);
+      continue;
+    }
     const sendRatchet = new SendRatchet(pair.sendCK);
     const recvRatchet = new ReceiveRatchet(pair.recvCK);
     const mediaSendRatchet = new SendRatchet(pair.mediaSendCK);
-    const mediaRecvRatchet = new ReceiveRatchet(pair.mediaRecvCK, MEDIA_RATCHET_WINDOW, MEDIA_MAX_SKIPPED_KEYS);
+    const mediaRecvRatchet = new ReceiveRatchet(
+      pair.mediaRecvCK,
+      MEDIA_RATCHET_WINDOW,
+      MEDIA_MAX_SKIPPED_KEYS
+    );
     zeroize(pair.sendCK);
     zeroize(pair.recvCK);
     zeroize(pair.mediaSendCK);
@@ -1465,7 +1532,10 @@ async function handleRelay(envelope: RelayEnvelope, allowQueue = true): Promise<
   if (!payload) {
     peer.decryptFailures += 1;
     const now = Date.now();
-    if (envelope.kind !== "call-media" && now - peer.lastFailureNoticeAt > FAILURE_NOTICE_INTERVAL_MS) {
+    if (
+      envelope.kind !== "call-media" &&
+      now - peer.lastFailureNoticeAt > FAILURE_NOTICE_INTERVAL_MS
+    ) {
       addSystemMessage(`${peer.displayName} 有密文未通过验证，已丢弃。`);
       peer.lastFailureNoticeAt = now;
     }
@@ -1766,8 +1836,11 @@ function notifyIncomingMessage(state: Runtime, message: ChatMessage): void {
   }
   const scope = message.scope === "private" ? "私聊" : "房间";
   const title =
-    message.scope === "private" ? `${message.author} 发来私聊消息` : `${message.author} 发来房间消息`;
-  const kindText = message.kind === "image" ? "图片消息" : message.kind === "file" ? "文件消息" : "文本消息";
+    message.scope === "private"
+      ? `${message.author} 发来私聊消息`
+      : `${message.author} 发来房间消息`;
+  const kindText =
+    message.kind === "image" ? "图片消息" : message.kind === "file" ? "文件消息" : "文本消息";
   const notification = new Notification(title, {
     body: `收到一条${scope}${kindText}`,
     tag: `${state.room.roomId}:${message.scope}`
@@ -1795,10 +1868,11 @@ async function sendPayloadWithContext(
   delivery: DeliveryContext,
   payload: PlainPayload,
   kind: RelayKind
-): Promise<void> {
+): Promise<boolean> {
   const outboundPayload: PlainPayload =
     delivery.scope === "private" ? { type: "private", inner: payload } : payload;
   const relayKind: RelayKind = delivery.scope === "private" ? "private" : kind;
+  let sent = false;
   for (const peer of delivery.targets) {
     const envelope = await sealPayload({
       roomId: state.room.roomId,
@@ -1809,11 +1883,16 @@ async function sendPayloadWithContext(
       ratchet: peer.sendRatchet,
       payload: outboundPayload
     });
-    state.ws.send(envelope);
+    sent = state.ws.send(envelope) || sent;
   }
+  return sent;
 }
 
-async function sendCallSignal(state: Runtime, peer: PeerRuntime, payload: CallSignalPayload): Promise<void> {
+async function sendCallSignal(
+  state: Runtime,
+  peer: PeerRuntime,
+  payload: CallSignalPayload
+): Promise<boolean> {
   const envelope = await sealPayload({
     roomId: state.room.roomId,
     from: state.clientId,
@@ -1823,10 +1902,14 @@ async function sendCallSignal(state: Runtime, peer: PeerRuntime, payload: CallSi
     ratchet: peer.sendRatchet,
     payload
   });
-  state.ws.send(envelope);
+  return state.ws.send(envelope);
 }
 
-async function sendCallControlSignal(state: Runtime, peer: PeerRuntime, payload: CallControlPayload): Promise<void> {
+async function sendCallControlSignal(
+  state: Runtime,
+  peer: PeerRuntime,
+  payload: CallControlPayload
+): Promise<boolean> {
   const seq = nextControlSeq();
   const aad = utf8(
     stableJson({
@@ -1844,7 +1927,7 @@ async function sendCallControlSignal(state: Runtime, peer: PeerRuntime, payload:
   const nonce = randomBytes(12);
   try {
     const ct = await aesGcmEncrypt(key, nonce, aad, utf8(stableJson(payload)));
-    state.ws.send({
+    return state.ws.send({
       v: 3,
       t: "relay",
       roomId: state.room.roomId,
@@ -1861,7 +1944,10 @@ async function sendCallControlSignal(state: Runtime, peer: PeerRuntime, payload:
   }
 }
 
-async function openCallControlEnvelope(envelope: RelayEnvelope, peer: PeerRuntime): Promise<CallControlPayload | null> {
+async function openCallControlEnvelope(
+  envelope: RelayEnvelope,
+  peer: PeerRuntime
+): Promise<CallControlPayload | null> {
   const aad = utf8(
     stableJson({
       v: 3,
@@ -1877,7 +1963,12 @@ async function openCallControlEnvelope(envelope: RelayEnvelope, peer: PeerRuntim
   const key = await callControlKey(peer);
   let plaintext: Uint8Array | null = null;
   try {
-    plaintext = await aesGcmDecrypt(key, base64urlDecode(envelope.nonce), aad, base64urlDecode(envelope.ct));
+    plaintext = await aesGcmDecrypt(
+      key,
+      base64urlDecode(envelope.nonce),
+      aad,
+      base64urlDecode(envelope.ct)
+    );
     const payload = JSON.parse(fromUtf8(plaintext));
     return isCallControlPayload(payload) ? payload : null;
   } catch {
@@ -1914,7 +2005,11 @@ function sendCallEndSignal(
   }
 }
 
-async function sendCallMedia(state: Runtime, peer: PeerRuntime, payload: CallMediaPayload): Promise<boolean> {
+async function sendCallMedia(
+  state: Runtime,
+  peer: PeerRuntime,
+  payload: CallMediaPayload
+): Promise<boolean> {
   if (state.ws.bufferedAmount() > CALL_MEDIA_BUFFER_CRITICAL_BYTES) {
     return false;
   }
@@ -2189,7 +2284,11 @@ function nextControlSeq(): number {
 
 function acceptCallControl(peer: PeerRuntime, seq: number, createdAt: number): boolean {
   const now = Date.now();
-  if (!Number.isSafeInteger(seq) || seq <= 0 || Math.abs(now - createdAt) > CALL_CONTROL_MAX_AGE_MS) {
+  if (
+    !Number.isSafeInteger(seq) ||
+    seq <= 0 ||
+    Math.abs(now - createdAt) > CALL_CONTROL_MAX_AGE_MS
+  ) {
     return false;
   }
   if (peer.seenControlSeq.has(seq)) {
@@ -2216,7 +2315,8 @@ function isCallControlPayload(value: unknown): value is CallControlPayload {
     payload.type === "call-end" &&
     typeof payload.callId === "string" &&
     /^[A-Za-z0-9_-]{1,128}$/u.test(payload.callId) &&
-    (payload.reason === undefined || (typeof payload.reason === "string" && payload.reason.length <= 120)) &&
+    (payload.reason === undefined ||
+      (typeof payload.reason === "string" && payload.reason.length <= 120)) &&
     typeof payload.createdAt === "number" &&
     Number.isSafeInteger(payload.createdAt) &&
     payload.createdAt > 0
@@ -2345,24 +2445,29 @@ async function getCallMedia(media: CallMediaKind): Promise<CallMediaGrant> {
   }
   if (media === "audio") {
     return {
-      stream: await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: false
-      })
+      stream: await requestMediaWithFallback({ audio: true, video: false }, [
+        { audio: { echoCancellation: true }, video: false }
+      ])
     };
   }
   try {
     return {
-      stream: await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: callVideoConstraints()
-      })
+      stream: await requestMediaWithFallback(
+        {
+          audio: true,
+          video: callVideoConstraints()
+        },
+        [{ audio: true, video: true }]
+      )
     };
   } catch (error) {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: callVideoConstraints()
-    });
+    const stream = await requestMediaWithFallback(
+      {
+        audio: false,
+        video: callVideoConstraints()
+      },
+      [{ audio: false, video: true }]
+    );
     return {
       stream,
       warning: `麦克风不可用，已只发送视频。原始原因：${mediaErrorText(error, "video")}`
@@ -2370,10 +2475,43 @@ async function getCallMedia(media: CallMediaKind): Promise<CallMediaGrant> {
   }
 }
 
+async function requestMediaWithFallback(
+  primary: MediaStreamConstraints,
+  fallbacks: MediaStreamConstraints[] = []
+): Promise<MediaStream> {
+  const errors: unknown[] = [];
+  for (const constraints of [primary, ...fallbacks]) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  throw bestMediaError(errors);
+}
+
+function bestMediaError(errors: unknown[]): unknown {
+  return (
+    errors.find((error) => !isOverconstrainedMediaError(error)) ??
+    errors[0] ??
+    new Error("media devices unavailable")
+  );
+}
+
+function isOverconstrainedMediaError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    String((error as { name?: unknown }).name ?? "") === "OverconstrainedError"
+  );
+}
+
 function mediaErrorText(error: unknown, media: CallMediaKind): string {
   if (typeof error === "object" && error !== null && "name" in error) {
     const name = String((error as { name?: unknown }).name ?? "");
-    const message = "message" in error ? String((error as { message?: unknown }).message ?? "") : "";
+    const message =
+      "message" in error ? String((error as { message?: unknown }).message ?? "") : "";
     if (name === "NotAllowedError") {
       return media === "audio" ? "浏览器拒绝了麦克风权限" : "浏览器拒绝了摄像头或麦克风权限";
     }
@@ -2400,7 +2538,8 @@ function mediaErrorText(error: unknown, media: CallMediaKind): string {
 function rawMediaErrorText(error: unknown): string {
   if (typeof error === "object" && error !== null && "name" in error) {
     const name = String((error as { name?: unknown }).name ?? "");
-    const message = "message" in error ? String((error as { message?: unknown }).message ?? "") : "";
+    const message =
+      "message" in error ? String((error as { message?: unknown }).message ?? "") : "";
     return [name, message].filter(Boolean).join(": ");
   }
   return error instanceof Error ? error.message : String(error);
@@ -2421,10 +2560,24 @@ function drawVideoContain(
   const targetY = Math.floor((height - targetHeight) / 2);
   context.fillStyle = "#111827";
   context.fillRect(0, 0, width, height);
-  context.drawImage(video, 0, 0, sourceWidth, sourceHeight, targetX, targetY, targetWidth, targetHeight);
+  context.drawImage(
+    video,
+    0,
+    0,
+    sourceWidth,
+    sourceHeight,
+    targetX,
+    targetY,
+    targetWidth,
+    targetHeight
+  );
 }
 
-function drawCameraOffFrame(context: CanvasRenderingContext2D, width: number, height: number): void {
+function drawCameraOffFrame(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number
+): void {
   const centerX = width / 2;
   const centerY = height / 2;
   const radius = Math.max(18, Math.min(width, height) * 0.15);
@@ -2470,7 +2623,11 @@ function permissionStateText(state: MediaPermissionState): string {
   return "未知";
 }
 
-async function callFailureText(action: "发起" | "接听", media: CallMediaKind, error: unknown): Promise<string> {
+async function callFailureText(
+  action: "发起" | "接听",
+  media: CallMediaKind,
+  error: unknown
+): Promise<string> {
   const base = `无法${action}${mediaLabel(media)}通话：${mediaErrorText(error, media)}。`;
   const detail = rawMediaErrorText(error);
   const microphone = await queryMediaPermission("microphone");
@@ -2483,13 +2640,23 @@ async function callFailureText(action: "发起" | "接听", media: CallMediaKind
     window.location.hostname === "127.0.0.1"
       ? "如果权限已允许但仍失败，请刷新后改用 http://localhost:8088 再试。"
       : "";
-  const secureHint = window.isSecureContext ? "" : "当前页面不是安全上下文，请改用 localhost 或 HTTPS。";
+  const secureHint = window.isSecureContext
+    ? ""
+    : "当前页面不是安全上下文，请改用 localhost 或 HTTPS。";
   const systemHint =
     isNotAllowedMediaError(error) && (microphone === "granted" || camera === "granted")
       ? "站点权限已显示允许但仍被拒绝时，通常是系统隐私权限、浏览器策略或设备沙盒拦截。"
       : "";
-  const showDebugDetail = window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost";
-  return [base, permissionDetail, secureHint, systemHint, originHint, showDebugDetail && detail ? `浏览器返回：${detail}` : ""]
+  const showDebugDetail =
+    window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost";
+  return [
+    base,
+    permissionDetail,
+    secureHint,
+    systemHint,
+    originHint,
+    showDebugDetail && detail ? `浏览器返回：${detail}` : ""
+  ]
     .filter(Boolean)
     .join(" ");
 }
@@ -2499,7 +2666,12 @@ function startIncomingRingtone(state: Runtime, call: CallRuntime): void {
     return;
   }
   const start = () => {
-    if (runtime !== state || state.call !== call || call.status !== "incoming" || call.ringtoneTimerId !== null) {
+    if (
+      runtime !== state ||
+      state.call !== call ||
+      call.status !== "incoming" ||
+      call.ringtoneTimerId !== null
+    ) {
       return;
     }
     if (!playCallRingtone()) {
@@ -2531,7 +2703,12 @@ function startIncomingRingtone(state: Runtime, call: CallRuntime): void {
     .catch(() => undefined);
 }
 
-function notifyIncomingCall(state: Runtime, call: CallRuntime, peer: PeerRuntime, media: CallMediaKind): void {
+function notifyIncomingCall(
+  state: Runtime,
+  call: CallRuntime,
+  peer: PeerRuntime,
+  media: CallMediaKind
+): void {
   startIncomingRingtone(state, call);
   if (!state.notificationsEnabled || notificationPermission() !== "granted" || isWindowActive()) {
     return;
@@ -2541,8 +2718,8 @@ function notifyIncomingCall(state: Runtime, call: CallRuntime, peer: PeerRuntime
       ? `${peer.displayName} 发起房间${mediaLabel(media)}通话`
       : `${peer.displayName} 发起${mediaLabel(media)}通话`,
     {
-    body: "打开页面接听或拒绝",
-    tag: `${state.room.roomId}:call:${peer.clientId}`
+      body: "打开页面接听或拒绝",
+      tag: `${state.room.roomId}:call:${peer.clientId}`
     }
   );
   notification.addEventListener("click", () => {
@@ -2600,7 +2777,9 @@ async function startRoomCall(media: CallMediaKind): Promise<void> {
     return;
   }
   if (state.peers.size > CALL_MAX_ROOM_TARGETS) {
-    addSystemMessage(`房间通话暂时最多邀请 ${CALL_MAX_ROOM_TARGETS} 人，已邀请前 ${CALL_MAX_ROOM_TARGETS} 位在线成员。`);
+    addSystemMessage(
+      `房间通话暂时最多邀请 ${CALL_MAX_ROOM_TARGETS} 人，已邀请前 ${CALL_MAX_ROOM_TARGETS} 位在线成员。`
+    );
   }
   await startOutgoingCall(targets, media, "room");
 }
@@ -2681,7 +2860,12 @@ async function startOutgoingCall(
       targetIds: call.targetIds,
       createdAt: Date.now()
     };
-    await Promise.all(targets.map((target) => sendCallSignal(state, target, offer)));
+    const offerResults = await Promise.all(
+      targets.map((target) => sendCallSignal(state, target, offer))
+    );
+    if (!offerResults.some(Boolean)) {
+      throw new Error("通话信令未发送");
+    }
     call.status = "outgoing";
     renderChat();
   } catch (error) {
@@ -2747,7 +2931,12 @@ async function acceptIncomingCall(): Promise<void> {
       mode: "encoded-media",
       createdAt: Date.now()
     };
-    await Promise.all(callAnswerTargets(state, call).map((target) => sendCallSignal(state, target, answer)));
+    const answerResults = await Promise.all(
+      callAnswerTargets(state, call).map((target) => sendCallSignal(state, target, answer))
+    );
+    if (!answerResults.some(Boolean)) {
+      throw new Error("通话信令未发送");
+    }
     ensureCallParticipant(call, peer, "active");
     call.status = "active";
     await startEncodedPublisher(state, call);
@@ -2795,10 +2984,15 @@ async function handleCallSignal(
       return;
     }
     peer.lastIncomingCallOfferAt = Date.now();
-    if (payload.targetIds && payload.targetIds.length > 0 && !payload.targetIds.includes(state.clientId)) {
+    if (
+      payload.targetIds &&
+      payload.targetIds.length > 0 &&
+      !payload.targetIds.includes(state.clientId)
+    ) {
       return;
     }
-    const targetIds = payload.targetIds && payload.targetIds.length > 0 ? payload.targetIds : [state.clientId];
+    const targetIds =
+      payload.targetIds && payload.targetIds.length > 0 ? payload.targetIds : [state.clientId];
     const scope: CallScope = targetIds.length > 1 ? "room" : "private";
     const participants = new Map<string, CallParticipant>();
     const incomingParticipant = createCallParticipant(peer, "ringing");
@@ -3027,8 +3221,7 @@ async function startEncodedVideo(
     const queueSize = publisher.videoEncoder.encodeQueueSize;
     const buffered = state.ws.bufferedAmount();
     const congested =
-      queueSize >= CALL_VIDEO_ENCODER_QUEUE_LIMIT ||
-      buffered > CALL_MEDIA_BUFFER_CRITICAL_BYTES;
+      queueSize >= CALL_VIDEO_ENCODER_QUEUE_LIMIT || buffered > CALL_MEDIA_BUFFER_CRITICAL_BYTES;
     const targetFrameIntervalMs = call.cameraOff ? 1_000 : callFrameIntervalMs(state, call);
     const tooSoon =
       publisher.lastVideoEncodeAt > 0 &&
@@ -3053,7 +3246,8 @@ async function startEncodedVideo(
         const frame = new FrameCtor(captureCanvas, { timestamp });
         const keyFrame =
           call.cameraOff ||
-          publisher.lastKeyFrameAt === 0 || now - publisher.lastKeyFrameAt >= CALL_KEYFRAME_INTERVAL_MS;
+          publisher.lastKeyFrameAt === 0 ||
+          now - publisher.lastKeyFrameAt >= CALL_KEYFRAME_INTERVAL_MS;
         publisher.videoEncoder.encode(frame, { keyFrame });
         frame.close();
         publisher.lastVideoEncodeAt = now;
@@ -3082,8 +3276,7 @@ async function startEncodedVideo(
         ? Math.max(260, targetFrameIntervalMs * 0.9)
         : Math.max(260, targetFrameIntervalMs * 2.5);
       const stale =
-        publisher.lastVideoEncodeAt === 0 ||
-        now - publisher.lastVideoEncodeAt > staleLimitMs;
+        publisher.lastVideoEncodeAt === 0 || now - publisher.lastVideoEncodeAt > staleLimitMs;
       if (!hasVideoFrameCallback || stale) {
         encodeFrame(now, null);
       }
@@ -3157,7 +3350,10 @@ async function startEncodedAudio(
   const config: AudioEncoderConfigLike = {
     codec: "opus",
     sampleRate: typeof settings.sampleRate === "number" ? settings.sampleRate : 48_000,
-    numberOfChannels: typeof settings.channelCount === "number" ? Math.max(1, Math.min(2, settings.channelCount)) : 1,
+    numberOfChannels:
+      typeof settings.channelCount === "number"
+        ? Math.max(1, Math.min(2, settings.channelCount))
+        : 1,
     bitrate: CALL_AUDIO_BITRATE
   };
   try {
@@ -3186,7 +3382,10 @@ async function startEncodedAudio(
   }
 }
 
-async function readEncodedAudioFrames(call: CallRuntime, publisher: EncodedCallPublisher): Promise<void> {
+async function readEncodedAudioFrames(
+  call: CallRuntime,
+  publisher: EncodedCallPublisher
+): Promise<void> {
   while (!publisher.closed && publisher.audioReader && publisher.audioEncoder) {
     const next = await publisher.audioReader.read().catch(() => null);
     if (!next || next.done) {
@@ -3207,7 +3406,13 @@ async function sendEncodedAudioChunk(
   publisher: EncodedCallPublisher,
   chunk: EncodedChunkLike
 ): Promise<void> {
-  if (publisher.closed || runtime !== state || state.call !== call || !publisher.audioConfig || call.muted) {
+  if (
+    publisher.closed ||
+    runtime !== state ||
+    state.call !== call ||
+    !publisher.audioConfig ||
+    call.muted
+  ) {
     return;
   }
   const bytes = new Uint8Array(chunk.byteLength);
@@ -3327,7 +3532,10 @@ function handleCallMedia(state: Runtime, peer: PeerRuntime, payload: CallMediaPa
     return;
   }
   if (payload.media === "video") {
-    if (call.media !== "video" || !trimSeenMediaSeq(participant.receiver.seenVideoSeq, payload.seq)) {
+    if (
+      call.media !== "video" ||
+      !trimSeenMediaSeq(participant.receiver.seenVideoSeq, payload.seq)
+    ) {
       return;
     }
     decodeCallVideo(state, call, participant, payload);
@@ -3431,7 +3639,12 @@ function drawDecodedVideoFrame(participant: CallParticipant, frame: VideoFrameLi
 
 function decodeCallAudio(participant: CallParticipant, payload: CallMediaPayload): void {
   const codecs = webCodecsRuntime();
-  if (!codecs.AudioDecoder || !codecs.EncodedAudioChunk || !payload.sampleRate || !payload.numberOfChannels) {
+  if (
+    !codecs.AudioDecoder ||
+    !codecs.EncodedAudioChunk ||
+    !payload.sampleRate ||
+    !payload.numberOfChannels
+  ) {
     return;
   }
   const receiver = participant.receiver;
@@ -3513,14 +3726,22 @@ function playDecodedAudio(participant: CallParticipant, audioData: AudioDataLike
   }
   const currentCall = runtime?.call;
   if (currentCall?.participants.get(participant.peerId) === participant) {
-    rememberCallAudioLevel(currentCall, participant.peerId, samples > 0 ? Math.sqrt(sum / samples) : 0);
+    rememberCallAudioLevel(
+      currentCall,
+      participant.peerId,
+      samples > 0 ? Math.sqrt(sum / samples) : 0
+    );
   }
   const source = context.createBufferSource();
   source.buffer = buffer;
   source.connect(context.destination);
-  source.addEventListener("ended", () => {
-    source.disconnect();
-  }, { once: true });
+  source.addEventListener(
+    "ended",
+    () => {
+      source.disconnect();
+    },
+    { once: true }
+  );
   if (receiver.nextAudioTime - context.currentTime > CALL_MAX_AUDIO_QUEUE_DELAY_SEC) {
     receiver.nextAudioTime = context.currentTime + 0.05;
   }
@@ -3554,7 +3775,12 @@ async function sendTextMessage(text: string): Promise<void> {
   if (delivery.peerName) {
     ownMessage.peerName = delivery.peerName;
   }
-  await sendPayloadWithContext(state, delivery, textPayload, "text");
+  const sent = await sendPayloadWithContext(state, delivery, textPayload, "text");
+  if (delivery.targets.length > 0 && !sent) {
+    state.draftText = text;
+    addSystemMessage("当前连接未就绪，消息未发送。");
+    return;
+  }
   pushMessage(state, ownMessage);
   renderChat();
 }
@@ -3591,7 +3817,7 @@ async function sendImageBlob(blob: Blob, fallbackName: string): Promise<void> {
     ownMessage.peerName = delivery.peerName;
   }
   try {
-    await sendPayloadWithContext(
+    const sent = await sendPayloadWithContext(
       state,
       delivery,
       {
@@ -3602,6 +3828,9 @@ async function sendImageBlob(blob: Blob, fallbackName: string): Promise<void> {
       },
       "image"
     );
+    if (delivery.targets.length > 0 && !sent) {
+      throw new Error("send_failed");
+    }
     pushMessage(state, ownMessage);
     renderChat();
   } catch (error) {
@@ -3627,51 +3856,66 @@ async function sendAttachmentFile(file: File): Promise<void> {
   const name = fileNameOrFallback(file);
   const mime = mimeOrFallback(file.type);
   const digest = await sha256(bytes);
-  await sendPayloadWithContext(
-    state,
-    delivery,
-    {
-      type: "file-meta",
-      fileId,
-      name,
-      mime,
-      size: bytes.length,
-      chunks,
-      createdAt
-    },
-    "file-meta"
-  );
+  if (
+    delivery.targets.length > 0 &&
+    !(await sendPayloadWithContext(
+      state,
+      delivery,
+      {
+        type: "file-meta",
+        fileId,
+        name,
+        mime,
+        size: bytes.length,
+        chunks,
+        createdAt
+      },
+      "file-meta"
+    ))
+  ) {
+    throw new Error("send_failed");
+  }
   const chunkDelayMs =
     delivery.targets.length > 0 ? Math.max(90, delivery.targets.length * 125) : 0;
   for (let index = 0; index < chunks; index += 1) {
     const start = index * FILE_CHUNK_BYTES;
     const chunk = bytes.subarray(start, Math.min(start + FILE_CHUNK_BYTES, bytes.length));
-    await sendPayloadWithContext(
-      state,
-      delivery,
-      {
-        type: "file-chunk",
-        fileId,
-        index,
-        total: chunks,
-        bytes: base64urlEncode(chunk)
-      },
-      "file-chunk"
-    );
+    if (
+      delivery.targets.length > 0 &&
+      !(await sendPayloadWithContext(
+        state,
+        delivery,
+        {
+          type: "file-chunk",
+          fileId,
+          index,
+          total: chunks,
+          bytes: base64urlEncode(chunk)
+        },
+        "file-chunk"
+      ))
+    ) {
+      throw new Error("send_failed");
+    }
     if (chunkDelayMs > 0 && index < chunks - 1) {
       await delay(chunkDelayMs);
     }
   }
-  await sendPayloadWithContext(
-    state,
-    delivery,
-    {
-      type: "file-done",
-      fileId,
-      sha256: base64urlEncode(digest)
-    },
-    "file-done"
-  );
+  if (
+    delivery.targets.length > 0 &&
+    !(await sendPayloadWithContext(
+      state,
+      delivery,
+      {
+        type: "file-done",
+        fileId,
+        sha256: base64urlEncode(digest)
+      },
+      "file-done"
+    ))
+  ) {
+    throw new Error("send_failed");
+  }
   const ownMessage: ChatMessage = {
     id: `own:file:${createdAt}:${Math.random()}`,
     own: true,
@@ -3879,13 +4123,18 @@ function renderTopbar(state: Runtime, privatePeer: PeerRuntime | null): HTMLElem
     renderLogin();
   });
   actions.push(leave);
-  return el("header", { className: "topbar" }, [status, el("div", { className: "topbar-actions" }, actions)]);
+  return el("header", { className: "topbar" }, [
+    status,
+    el("div", { className: "topbar-actions" }, actions)
+  ]);
 }
 
 function renderModeBanner(privatePeer: PeerRuntime | null): HTMLElement {
   return el("div", {
     className: privatePeer ? "mode-banner private" : "mode-banner room",
-    text: privatePeer ? `私聊模式：消息只发送给 ${privatePeer.displayName}` : "房间模式：消息会发送给所有在线成员"
+    text: privatePeer
+      ? `私聊模式：消息只发送给 ${privatePeer.displayName}`
+      : "房间模式：消息会发送给所有在线成员"
   });
 }
 
@@ -3902,7 +4151,9 @@ function renderMessageRow(message: ChatMessage): HTMLElement {
     className: ["message", message.own ? "own" : "", message.scope].filter(Boolean).join(" ")
   });
   const scopeText =
-    message.scope === "private" ? `私聊${message.peerName ? ` · ${message.peerName}` : ""}` : "房间";
+    message.scope === "private"
+      ? `私聊${message.peerName ? ` · ${message.peerName}` : ""}`
+      : "房间";
   row.append(
     el("div", {
       className: "message-meta",
@@ -3952,10 +4203,14 @@ function renderFileMessage(message: ChatMessage): HTMLElement {
   download.addEventListener("click", () => {
     safeDownload(fileBlob, message.fileName ?? "attachment.bin");
   });
-  return el("div", { className: "file-message" }, [el("div", { className: "file-icon", text: "📎" }), fileInfo, download]);
+  return el("div", { className: "file-message" }, [
+    el("div", { className: "file-icon", text: "📎" }),
+    fileInfo,
+    download
+  ]);
 }
 
-function renderComposer(): HTMLElement {
+function renderComposer(state: Runtime): HTMLElement {
   const composer = el("form", { className: "composer" });
   const composerPill = el("div", { className: "composer-pill" });
   const emojiWrap = el("div", { className: "emoji-wrap" });
@@ -3978,7 +4233,8 @@ function renderComposer(): HTMLElement {
   let emojiRecords: EmojiRecord[] | null = null;
   const input = el("textarea", {
     className: "composer-input",
-    placeholder: "消息"
+    placeholder: "消息",
+    value: state.draftText
   });
   input.rows = 1;
   const syncInputHeight = () => {
@@ -4109,6 +4365,9 @@ function renderComposer(): HTMLElement {
   });
   send.type = "submit";
   input.addEventListener("input", syncInputHeight);
+  input.addEventListener("input", () => {
+    state.draftText = input.value;
+  });
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -4132,11 +4391,20 @@ function renderComposer(): HTMLElement {
     event.preventDefault();
     const value = input.value;
     input.value = "";
+    state.draftText = "";
     syncInputHeight();
     emojiPanel.classList.remove("open");
-    void sendTextMessage(value).finally(() => {
-      focusComposerInput();
-    });
+    void sendTextMessage(value)
+      .catch(() => {
+        const state = runtime;
+        if (state) {
+          state.draftText = value;
+          addSystemMessage("消息发送失败，已保留输入内容。");
+        }
+      })
+      .finally(() => {
+        focusComposerInput();
+      });
   });
   composerPill.append(emojiWrap, input, attach, fileInput);
   composer.append(composerPill, send);
@@ -4144,7 +4412,11 @@ function renderComposer(): HTMLElement {
   return composer;
 }
 
-function renderMediaElement(stream: MediaStream, className: string, muted: boolean): HTMLVideoElement | HTMLAudioElement {
+function renderMediaElement(
+  stream: MediaStream,
+  className: string,
+  muted: boolean
+): HTMLVideoElement | HTMLAudioElement {
   const hasVideo = stream.getVideoTracks().length > 0;
   const media = el(hasVideo ? "video" : "audio", { className });
   media.autoplay = true;
@@ -4161,7 +4433,9 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
   }
   const isIncoming = call.status === "incoming";
   const panel = el("section", { className: ["call-panel", call.media, call.scope].join(" ") });
-  const liveCount = [...call.participants.values()].filter((participant) => participant.status === "active").length;
+  const liveCount = [...call.participants.values()].filter(
+    (participant) => participant.status === "active"
+  ).length;
   const participantCount = call.participants.size;
   const title =
     call.scope === "room"
@@ -4185,13 +4459,23 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
       const tile = el("div", { className: "call-remote-tile" });
       setDataset(tile, "speaker", participant.peerId);
       const profile = call.publisher?.videoConfig ?? callVideoProfile(call);
-      const canvas = el("canvas", { className: "call-remote-media call-remote-canvas" }) as HTMLCanvasElement;
+      const canvas = el("canvas", {
+        className: "call-remote-media call-remote-canvas"
+      }) as HTMLCanvasElement;
       canvas.width = profile.width;
       canvas.height = profile.height;
       participant.remoteCanvas = canvas;
-      tile.append(canvas, el("div", { className: "call-participant-name", text: participant.peerName }));
+      tile.append(
+        canvas,
+        el("div", { className: "call-participant-name", text: participant.peerName })
+      );
       if (!participant.receiver.gotVideoKeyFrame) {
-        tile.append(el("div", { className: "call-waiting", text: participant.status === "active" ? "等待画面" : "等待接听" }));
+        tile.append(
+          el("div", {
+            className: "call-waiting",
+            text: participant.status === "active" ? "等待画面" : "等待接听"
+          })
+        );
       }
       remoteGrid.append(tile);
     }
@@ -4214,7 +4498,12 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
         el("div", { className: "call-audio-name", text: participant.peerName }),
         el("div", {
           className: "call-audio-state",
-          text: participant.status === "active" ? "已接入" : participant.status === "ended" ? "已离开" : "等待接听"
+          text:
+            participant.status === "active"
+              ? "已接入"
+              : participant.status === "ended"
+                ? "已离开"
+                : "等待接听"
         })
       ]);
       setDataset(card, "speaker", participant.peerId);
@@ -4222,7 +4511,9 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
     }
   }
   if (!remoteGrid.hasChildNodes()) {
-    remoteGrid.append(el("div", { className: "call-waiting", text: CALL_STATUS_TEXT[call.status] }));
+    remoteGrid.append(
+      el("div", { className: "call-waiting", text: CALL_STATUS_TEXT[call.status] })
+    );
   }
   mediaStage.append(remoteGrid);
   if (call.media === "video" && call.localStream && call.localStream.getVideoTracks().length > 0) {
@@ -4260,7 +4551,10 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
     });
     actions.append(mute);
     if (call.media === "video") {
-      const camera = el("button", { className: "call-control", text: call.cameraOff ? "开镜头" : "关镜头" });
+      const camera = el("button", {
+        className: "call-control",
+        text: call.cameraOff ? "开镜头" : "关镜头"
+      });
       camera.type = "button";
       camera.addEventListener("click", (event) => {
         call.cameraOff = !call.cameraOff;
@@ -4301,11 +4595,16 @@ function renderChat(): void {
     renderLogin();
     return;
   }
-  const privatePeer = state.privatePeerId ? state.peers.get(state.privatePeerId) ?? null : null;
+  const privatePeer = state.privatePeerId ? (state.peers.get(state.privatePeerId) ?? null) : null;
   const layout = el("section", { className: "chat-layout" });
   const main = el("section", { className: "chat-main" });
   const messages = renderMessageList(state);
-  main.append(renderTopbar(state, privatePeer), renderModeBanner(privatePeer), messages, renderComposer());
+  main.append(
+    renderTopbar(state, privatePeer),
+    renderModeBanner(privatePeer),
+    messages,
+    renderComposer(state)
+  );
   layout.append(renderSidebar(state), main);
   const callLayer = renderCallLayer(state);
   if (callLayer) {
@@ -4416,7 +4715,9 @@ function showInviteDialog(
       qrCanvas.style.width = `${INVITE_QR_SIZE}px`;
       qrCanvas.style.height = `${INVITE_QR_SIZE}px`;
       qrStatus.textContent =
-        mode === "two-channel" ? "点击复制二维码；扫码仍需安全秘钥。" : "点击复制二维码；扫码即可加入。";
+        mode === "two-channel"
+          ? "点击复制二维码；扫码仍需安全秘钥。"
+          : "点击复制二维码；扫码即可加入。";
     })
     .catch(() => {
       qrStatus.textContent = "二维码生成失败，请复制链接分享。";
@@ -4437,17 +4738,16 @@ function showInviteDialog(
     }),
     el("div", { className: "invite-share-grid" }, [
       qrCard,
-      el("div", { className: mode === "two-channel" ? "invite-copy-stack" : "invite-copy-stack single" }, [
-        linkSection,
-        secretSection
-      ])
+      el(
+        "div",
+        { className: mode === "two-channel" ? "invite-copy-stack" : "invite-copy-stack single" },
+        [linkSection, secretSection]
+      )
     ]),
     notice
   );
   if (mode !== "two-channel") {
-    dialog.append(
-      el("div", { className: "warning", text: "链接被转发即获得进入能力。" })
-    );
+    dialog.append(el("div", { className: "warning", text: "链接被转发即获得进入能力。" }));
   }
   backdrop.append(dialog);
   document.body.append(backdrop);

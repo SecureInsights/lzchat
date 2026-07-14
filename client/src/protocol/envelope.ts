@@ -66,14 +66,17 @@ export async function openPayload(
     transcriptHash
   };
   const aad = utf8(stableJson(aadObject));
-  const nonce = base64urlDecode(envelope.nonce);
-  const expectedNonce = await deriveNonce(key, envelope.kind, envelope.seq, aad);
+  let nonce: Uint8Array | null = null;
+  let expectedNonce: Uint8Array | null = null;
+  let plaintext: Uint8Array | null = null;
   try {
+    nonce = base64urlDecode(envelope.nonce);
+    expectedNonce = await deriveNonce(key, envelope.kind, envelope.seq, aad);
     if (base64urlEncode(nonce) !== base64urlEncode(expectedNonce)) {
       ratchet.restoreSkipped(envelope.seq, key);
       return null;
     }
-    const plaintext = await aesGcmDecrypt(key, nonce, aad, base64urlDecode(envelope.ct));
+    plaintext = await aesGcmDecrypt(key, nonce, aad, base64urlDecode(envelope.ct));
     ratchet.markAccepted(envelope.seq);
     return validatePlainPayload(JSON.parse(fromUtf8(plaintext)));
   } catch {
@@ -81,6 +84,14 @@ export async function openPayload(
     return null;
   } finally {
     zeroize(key);
-    zeroize(expectedNonce);
+    if (nonce) {
+      zeroize(nonce);
+    }
+    if (expectedNonce) {
+      zeroize(expectedNonce);
+    }
+    if (plaintext) {
+      zeroize(plaintext);
+    }
   }
 }
