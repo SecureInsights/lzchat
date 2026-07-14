@@ -85,6 +85,10 @@ export class WsClient {
     return true;
   }
 
+  isOpen(): boolean {
+    return this.#socket?.readyState === WebSocket.OPEN;
+  }
+
   bufferedAmount(): number {
     return this.#socket?.bufferedAmount ?? 0;
   }

@@ -93,7 +93,11 @@ function compactSecretBytes(secret: InviteSecret): Uint8Array {
   if (secret.expiresAt !== null) {
     assertUnixMs(secret.expiresAt);
   }
-  if (!Number.isSafeInteger(secret.maxMembers) || secret.maxMembers <= 0 || secret.maxMembers > 255) {
+  if (
+    !Number.isSafeInteger(secret.maxMembers) ||
+    secret.maxMembers <= 0 ||
+    secret.maxMembers > 255
+  ) {
     throw new Error("invalid invite member cap");
   }
   const out = new Uint8Array(COMPACT_SECRET_BYTES);
@@ -207,7 +211,9 @@ function decodeCompactCapsule(value: string): InviteCapsule {
   };
 }
 
-export function createInviteSecret(options?: Partial<Omit<InviteSecret, "v" | "roomSeed" | "createdAt">>): InviteSecret {
+export function createInviteSecret(
+  options?: Partial<Omit<InviteSecret, "v" | "roomSeed" | "createdAt">>
+): InviteSecret {
   return {
     v: 3,
     roomSeed: base64urlEncode(randomBytes(32)),
@@ -290,7 +296,10 @@ export async function wrapInviteSecret(
   };
 }
 
-export async function unwrapInviteCapsule(capsule: InviteCapsule, passphrase: string): Promise<InviteSecret> {
+export async function unwrapInviteCapsule(
+  capsule: InviteCapsule,
+  passphrase: string
+): Promise<InviteSecret> {
   if (capsule.kdf !== "pbkdf2-sha256") {
     throw new Error("unsupported invite kdf");
   }
@@ -300,7 +309,12 @@ export async function unwrapInviteCapsule(capsule: InviteCapsule, passphrase: st
   const passKey = await pbkdf2Sha256(passphrase, salt, iterations);
   const inviteKey = await hkdf(passKey, "secure-chat/v3/invite-wrap", salt, 32);
   try {
-    const plaintext = await aesGcmDecrypt(inviteKey, nonce, utf8("invite-v3"), base64urlDecode(capsule.ct));
+    const plaintext = await aesGcmDecrypt(
+      inviteKey,
+      nonce,
+      utf8("invite-v3"),
+      base64urlDecode(capsule.ct)
+    );
     if (capsule.format !== "compact-v1") {
       throw new Error("unsupported invite format");
     }
@@ -315,14 +329,23 @@ export async function unwrapInviteCapsule(capsule: InviteCapsule, passphrase: st
   }
 }
 
-export async function inviteToSecret(invite: ParsedInvite, passphrase?: string): Promise<InviteSecret> {
-  if (invite.mode === "single-link") {
-    return invite.secret;
+export async function inviteToSecret(
+  invite: ParsedInvite,
+  passphrase?: string
+): Promise<InviteSecret> {
+  const secret =
+    invite.mode === "single-link"
+      ? invite.secret
+      : await (async () => {
+          if (!passphrase) {
+            throw new Error("passphrase required");
+          }
+          return unwrapInviteCapsule(invite, passphrase);
+        })();
+  if (secret.expiresAt !== null && Date.now() > secret.expiresAt) {
+    throw new Error("invite expired");
   }
-  if (!passphrase) {
-    throw new Error("passphrase required");
-  }
-  return unwrapInviteCapsule(invite, passphrase);
+  return secret;
 }
 
 export async function deriveRoomSecrets(secret: InviteSecret): Promise<RoomSecrets> {
@@ -346,12 +369,18 @@ export async function deriveRoomSecrets(secret: InviteSecret): Promise<RoomSecre
 }
 
 export function readInviteFromLocation(location: Location): string | null {
-  const params = new URLSearchParams(location.hash.startsWith("#") ? location.hash.slice(1) : location.hash);
+  const params = new URLSearchParams(
+    location.hash.startsWith("#") ? location.hash.slice(1) : location.hash
+  );
   return params.get("i");
 }
 
 export function clearLocationFragment(): void {
   if (window.location.hash) {
-    history.replaceState(null, document.title, `${window.location.pathname}${window.location.search}`);
+    history.replaceState(
+      null,
+      document.title,
+      `${window.location.pathname}${window.location.search}`
+    );
   }
 }

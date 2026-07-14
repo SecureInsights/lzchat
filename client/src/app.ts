@@ -917,6 +917,38 @@ function noteInvalidPeerKey(state: Runtime, clientId: string): void {
   }
 }
 
+function removePeerState(
+  state: Runtime,
+  clientId: string
+): { peer: PeerRuntime | null; removedFromCall: boolean; endedCall: boolean } {
+  const peer = state.peers.get(clientId);
+  if (!peer) {
+    return { peer: null, removedFromCall: false, endedCall: false };
+  }
+  destroyPeer(peer);
+  state.peers.delete(clientId);
+  state.pendingRelays.delete(clientId);
+  state.privateUnread.delete(clientId);
+  state.invalidPeerNotices.delete(clientId);
+  deleteIncomingFilesFromPeer(state, clientId);
+  if (state.privatePeerId === clientId) {
+    state.privatePeerId = null;
+  }
+  let removedFromCall = false;
+  let endedCall = false;
+  if (state.call && callHasParticipant(state.call, clientId)) {
+    const activeCall = state.call;
+    removeCallParticipant(activeCall, clientId);
+    removedFromCall = true;
+    if (!hasLiveCallParticipants(activeCall)) {
+      state.call = null;
+      cleanupCall(activeCall);
+      endedCall = true;
+    }
+  }
+  return { peer, removedFromCall, endedCall };
+}
+
 async function processPendingRelays(): Promise<void> {
   const state = runtime;
   if (!state) {
@@ -1107,8 +1139,16 @@ function renderLogin(): void {
   const passInput = el("input", {
     type: "password",
     placeholder:
-      decodedInvite?.mode === "two-channel" ? "输入另一渠道收到的口令" : "创建时留空自动生成"
+      decodedInvite?.mode === "two-channel"
+        ? "输入另一渠道收到的口令"
+        : "创建可留空；加入私密链接时输入安全秘钥"
   });
+  const joinAction = el("button", {
+    className: "secondary",
+    text: "加入链接"
+  });
+  joinAction.type = "button";
+  joinAction.disabled = !isTrustedContext();
 
   const modeButtons = el("div", { className: "segmented" });
   const highButton = el("button", { text: "私密" });
@@ -1119,14 +1159,15 @@ function renderLogin(): void {
     highButton.classList.add("active");
     normalButton.classList.remove("active");
     passInput.disabled = false;
-    passInput.placeholder = "留空自动生成口令";
+    passInput.placeholder = "创建可留空；加入私密链接时输入安全秘钥";
   });
   normalButton.addEventListener("click", () => {
     mode = "single-link";
     normalButton.classList.add("active");
     highButton.classList.remove("active");
-    passInput.disabled = true;
+    passInput.disabled = false;
     passInput.value = "";
+    passInput.placeholder = "加入私密链接时输入安全秘钥；公开创建会忽略";
   });
   modeButtons.append(highButton, normalButton);
 
@@ -1152,6 +1193,8 @@ function renderLogin(): void {
     }
   } else {
     form.append(
+      el("label", { className: "field" }, ["加入邀请", inviteInput]),
+      joinAction,
       el("label", { className: "field" }, ["隐私性", modeButtons]),
       el("label", { className: "field" }, ["口令", passInput])
     );
@@ -1162,6 +1205,29 @@ function renderLogin(): void {
     text: decodedInvite ? "加入房间" : "创建房间"
   });
   action.disabled = !isTrustedContext();
+  const joinInvite = async () => {
+    const displayName = nameInput.value.trim().slice(0, 40) || "访客";
+    const roomName = roomInput.value.trim().slice(0, MAX_ROOM_NAME_CHARS) || DEFAULT_ROOM_NAME;
+    const inviteToken = parseInviteInput(inviteInput.value || pendingInviteToken || "");
+    const invite = decodeInvite(inviteToken);
+    const secret = await inviteToSecret(
+      invite,
+      invite.mode === "two-channel" ? passInput.value.trim() : undefined
+    );
+    await startRoom({ secret, roomName, displayName, mode: invite.mode });
+  };
+  joinAction.addEventListener("click", () => {
+    void (async () => {
+      try {
+        setNotice(notice, "");
+        joinAction.disabled = true;
+        await joinInvite();
+      } catch (error) {
+        setNotice(notice, error instanceof Error ? error.message : "加入失败", true);
+        joinAction.disabled = !isTrustedContext();
+      }
+    })();
+  });
   action.addEventListener("click", () => {
     void (async () => {
       try {
@@ -1169,14 +1235,8 @@ function renderLogin(): void {
         action.disabled = true;
         const displayName = nameInput.value.trim().slice(0, 40) || "访客";
         const roomName = roomInput.value.trim().slice(0, MAX_ROOM_NAME_CHARS) || DEFAULT_ROOM_NAME;
-        if (decodedInvite || inviteInput.value.trim()) {
-          const inviteToken = parseInviteInput(inviteInput.value || pendingInviteToken || "");
-          const invite = decodeInvite(inviteToken);
-          const secret = await inviteToSecret(
-            invite,
-            invite.mode === "two-channel" ? passInput.value : undefined
-          );
-          await startRoom({ secret, roomName, displayName, mode: invite.mode });
+        if (decodedInvite) {
+          await joinInvite();
           return;
         }
         const secret = createInviteSecret();
@@ -1200,7 +1260,7 @@ function renderLogin(): void {
         showInviteDialog(link, generatedPassphrase, mode);
       } catch (error) {
         setNotice(notice, error instanceof Error ? error.message : "操作失败", true);
-        action.disabled = false;
+        action.disabled = !isTrustedContext();
       }
     })();
   });
@@ -1334,20 +1394,12 @@ async function handleMembers(message: MembersMessage): Promise<void> {
   state.safetyCode = "计算中";
   state.members = message.members;
   const liveIds = new Set(message.members.map((member) => member.clientId));
-  for (const [clientId, peer] of state.peers) {
+  for (const [clientId, peer] of [...state.peers]) {
     if (!liveIds.has(clientId)) {
-      destroyPeer(peer);
-      state.peers.delete(clientId);
-      state.pendingRelays.delete(clientId);
-      state.privateUnread.delete(clientId);
-      deleteIncomingFilesFromPeer(state, clientId);
-      if (state.call && callHasParticipant(state.call, clientId)) {
-        const activeCall = state.call;
-        removeCallParticipant(activeCall, clientId);
+      const removed = removePeerState(state, clientId);
+      if (removed.removedFromCall) {
         addSystemMessage(`${peer.displayName} 已离开通话。`);
-        if (!hasLiveCallParticipants(activeCall)) {
-          state.call = null;
-          cleanupCall(activeCall);
+        if (removed.endedCall) {
           addSystemMessage("通话已结束。");
         }
       }
@@ -1364,13 +1416,13 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     if (existing && existing.sessionPub === member.sessionPub) {
       continue;
     }
-    if (existing && existing.sessionPub !== member.sessionPub) {
-      addSystemMessage(`${existing.displayName} 的会话密钥已更新。`);
-      deleteIncomingFilesFromPeer(state, member.clientId);
-    }
-    if (existing) {
-      destroyPeer(existing);
-    }
+    const wasPrivateTarget = state.privatePeerId === member.clientId;
+    const previousDisplayName = existing?.displayName;
+    const previousMessageWindow = existing?.messageWindow ?? [];
+    const previousMediaMessageWindow = existing?.mediaMessageWindow ?? [];
+    const previousMediaByteWindow = existing?.mediaByteWindow ?? [];
+    const previousSeenControlSeq = existing?.seenControlSeq ?? new Set<number>();
+    const previousLastIncomingCallOfferAt = existing?.lastIncomingCallOfferAt ?? 0;
     let pair: PairSession;
     try {
       pair = await derivePairSession({
@@ -1384,8 +1436,22 @@ async function handleMembers(message: MembersMessage): Promise<void> {
         capabilities: state.capabilities
       });
     } catch {
+      const removed = removePeerState(state, member.clientId);
       noteInvalidPeerKey(state, member.clientId);
+      if (removed.removedFromCall) {
+        addSystemMessage(`${removed.peer?.displayName ?? "成员"} 已从通话移除。`);
+        if (removed.endedCall) {
+          addSystemMessage("通话已结束。");
+        }
+      }
       continue;
+    }
+    if (existing && existing.sessionPub !== member.sessionPub) {
+      const removed = removePeerState(state, member.clientId);
+      addSystemMessage(`${previousDisplayName ?? "成员"} 的会话密钥已更新。`);
+      if (removed.removedFromCall) {
+        addSystemMessage("通话已重置。");
+      }
     }
     const sendRatchet = new SendRatchet(pair.sendCK);
     const recvRatchet = new ReceiveRatchet(pair.recvCK);
@@ -1402,7 +1468,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     state.peers.set(member.clientId, {
       clientId: member.clientId,
       sessionPub: member.sessionPub,
-      displayName: existing?.displayName ?? `临时成员 ${member.clientId.slice(0, 4)}`,
+      displayName: previousDisplayName ?? `临时成员 ${member.clientId.slice(0, 4)}`,
       capabilities: member.capabilities,
       pair,
       sendRatchet,
@@ -1411,14 +1477,17 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       mediaRecvRatchet,
       fingerprint: "计算中",
       profileSent: false,
-      messageWindow: existing?.messageWindow ?? [],
-      mediaMessageWindow: existing?.mediaMessageWindow ?? [],
-      mediaByteWindow: existing?.mediaByteWindow ?? [],
-      seenControlSeq: existing?.seenControlSeq ?? new Set(),
-      lastIncomingCallOfferAt: existing?.lastIncomingCallOfferAt ?? 0,
+      messageWindow: previousMessageWindow,
+      mediaMessageWindow: previousMediaMessageWindow,
+      mediaByteWindow: previousMediaByteWindow,
+      seenControlSeq: previousSeenControlSeq,
+      lastIncomingCallOfferAt: previousLastIncomingCallOfferAt,
       decryptFailures: 0,
       lastFailureNoticeAt: 0
     });
+    if (wasPrivateTarget) {
+      state.privatePeerId = member.clientId;
+    }
     void updatePeerFingerprint(state, member.clientId, member.sessionPub);
   }
   renderChat();
@@ -1869,6 +1938,9 @@ async function sendPayloadWithContext(
   payload: PlainPayload,
   kind: RelayKind
 ): Promise<boolean> {
+  if (delivery.targets.length > 0 && !state.ws.isOpen()) {
+    return false;
+  }
   const outboundPayload: PlainPayload =
     delivery.scope === "private" ? { type: "private", inner: payload } : payload;
   const relayKind: RelayKind = delivery.scope === "private" ? "private" : kind;
@@ -1893,6 +1965,9 @@ async function sendCallSignal(
   peer: PeerRuntime,
   payload: CallSignalPayload
 ): Promise<boolean> {
+  if (!state.ws.isOpen()) {
+    return false;
+  }
   const envelope = await sealPayload({
     roomId: state.room.roomId,
     from: state.clientId,
@@ -1910,6 +1985,9 @@ async function sendCallControlSignal(
   peer: PeerRuntime,
   payload: CallControlPayload
 ): Promise<boolean> {
+  if (!state.ws.isOpen()) {
+    return false;
+  }
   const seq = nextControlSeq();
   const aad = utf8(
     stableJson({
@@ -2010,6 +2088,9 @@ async function sendCallMedia(
   peer: PeerRuntime,
   payload: CallMediaPayload
 ): Promise<boolean> {
+  if (!state.ws.isOpen()) {
+    return false;
+  }
   if (state.ws.bufferedAmount() > CALL_MEDIA_BUFFER_CRITICAL_BYTES) {
     return false;
   }
@@ -4595,6 +4676,10 @@ function renderChat(): void {
     renderLogin();
     return;
   }
+  const previousMessages = appRoot.querySelector<HTMLElement>(".messages");
+  const shouldStickToBottom =
+    !previousMessages ||
+    previousMessages.scrollHeight - previousMessages.scrollTop - previousMessages.clientHeight < 96;
   const privatePeer = state.privatePeerId ? (state.peers.get(state.privatePeerId) ?? null) : null;
   const layout = el("section", { className: "chat-layout" });
   const main = el("section", { className: "chat-main" });
@@ -4611,7 +4696,9 @@ function renderChat(): void {
     layout.append(callLayer);
   }
   setApp(layout);
-  messages.scrollTop = messages.scrollHeight;
+  if (shouldStickToBottom) {
+    messages.scrollTop = messages.scrollHeight;
+  }
 }
 
 function showInviteDialog(
@@ -4619,6 +4706,9 @@ function showInviteDialog(
   passphrase: string,
   mode: "single-link" | "two-channel"
 ): void {
+  document.querySelectorAll(".invite-dialog").forEach((dialog) => {
+    dialog.closest(".modal-backdrop")?.remove();
+  });
   const backdrop = el("div", { className: "modal-backdrop" });
   const dialog = el("section", { className: "dialog invite-dialog" });
   const notice = el("div", { className: "copy-notice" });
