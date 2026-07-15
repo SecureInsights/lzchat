@@ -701,13 +701,7 @@ function avatarText(name: string): string {
 function insertTextAtCursor(input: HTMLTextAreaElement, value: string): void {
   input.setRangeText(value, input.selectionStart, input.selectionEnd, "end");
   input.dispatchEvent(new Event("input", { bubbles: true }));
-  input.focus();
-}
-
-function focusComposerInput(): void {
-  window.requestAnimationFrame(() => {
-    document.querySelector<HTMLTextAreaElement>(".composer-input")?.focus();
-  });
+  input.focus({ preventScroll: true });
 }
 
 function formatBytes(size: number): string {
@@ -865,7 +859,7 @@ function restoreComposerSnapshot(snapshot: ComposerSnapshot | null): void {
     input.value = snapshot.value;
     input.dispatchEvent(new Event("input", { bubbles: true }));
   }
-  input.focus();
+  input.focus({ preventScroll: true });
   const end = input.value.length;
   input.setSelectionRange(
     Math.min(snapshot.selectionStart, end),
@@ -882,6 +876,30 @@ function pushMessage(state: Runtime, message: ChatMessage): void {
       revokeMessageResources(oldMessage);
     }
   }
+}
+
+function appendMessageToRenderedList(
+  state: Runtime,
+  message: ChatMessage,
+  forceScrollToBottom = false
+): boolean {
+  const messages = appRoot.querySelector<HTMLElement>(".messages");
+  if (!messages) {
+    return false;
+  }
+  const shouldStickToBottom =
+    forceScrollToBottom || messages.scrollHeight - messages.scrollTop - messages.clientHeight < 96;
+  while (messages.children.length > Math.max(0, state.messages.length - 1)) {
+    messages.firstElementChild?.remove();
+  }
+  messages.append(renderMessageRow(message));
+  while (messages.children.length > state.messages.length) {
+    messages.firstElementChild?.remove();
+  }
+  if (shouldStickToBottom) {
+    messages.scrollTop = messages.scrollHeight;
+  }
+  return true;
 }
 
 function unreadLabel(count: number): string {
@@ -1440,12 +1458,22 @@ async function handleMembers(message: MembersMessage): Promise<void> {
   }
   state.membersEpoch += 1;
   const membersEpoch = state.membersEpoch;
+  const shouldNotifyMembershipChanges = membersEpoch > 1;
   state.safetyCode = "计算中";
   state.members = message.members;
   const liveIds = new Set(message.members.map((member) => member.clientId));
   for (const [clientId, peer] of [...state.peers]) {
     if (!liveIds.has(clientId)) {
       const removed = removePeerState(state, clientId);
+      if (shouldNotifyMembershipChanges) {
+        addSystemMessage(`${peer.displayName} 已离开房间。`);
+        notifyRoomEvent(
+          state,
+          `${peer.displayName} 已离开房间`,
+          "成员离开了当前房间。",
+          "membership"
+        );
+      }
       if (removed.removedFromCall) {
         addSystemMessage(`${peer.displayName} 已离开通话。`);
         if (removed.endedCall) {
@@ -1465,6 +1493,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     if (existing && existing.sessionPub === member.sessionPub) {
       continue;
     }
+    const isNewPeer = !existing;
     const wasPrivateTarget = state.privatePeerId === member.clientId;
     const previousDisplayName = existing?.displayName;
     const previousMessageWindow = existing?.messageWindow ?? [];
@@ -1514,7 +1543,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     zeroize(pair.recvCK);
     zeroize(pair.mediaSendCK);
     zeroize(pair.mediaRecvCK);
-    state.peers.set(member.clientId, {
+    const peerState: PeerRuntime = {
       clientId: member.clientId,
       sessionPub: member.sessionPub,
       displayName: previousDisplayName ?? `临时成员 ${member.clientId.slice(0, 4)}`,
@@ -1533,7 +1562,17 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       lastIncomingCallOfferAt: previousLastIncomingCallOfferAt,
       decryptFailures: 0,
       lastFailureNoticeAt: 0
-    });
+    };
+    state.peers.set(member.clientId, peerState);
+    if (isNewPeer && shouldNotifyMembershipChanges) {
+      addSystemMessage(`${peerState.displayName} 已加入房间。`);
+      notifyRoomEvent(
+        state,
+        `${peerState.displayName} 已加入房间`,
+        "成员加入了当前房间。",
+        "membership"
+      );
+    }
     if (wasPrivateTarget) {
       state.privatePeerId = member.clientId;
     }
@@ -1890,7 +1929,7 @@ function addSystemMessage(text: string): void {
   if (!state) {
     return;
   }
-  pushMessage(state, {
+  const message: ChatMessage = {
     id: `system:${Date.now()}:${Math.random()}`,
     own: false,
     author: "系统",
@@ -1898,8 +1937,11 @@ function addSystemMessage(text: string): void {
     text,
     createdAt: Date.now(),
     scope: "room"
-  });
-  renderChat();
+  };
+  pushMessage(state, message);
+  if (!appendMessageToRenderedList(state, message)) {
+    renderChat();
+  }
 }
 
 async function enableRoomNotifications(): Promise<void> {
@@ -1962,6 +2004,28 @@ function notifyIncomingMessage(state: Runtime, message: ChatMessage): void {
   const notification = new Notification(title, {
     body: `收到一条${scope}${kindText}`,
     tag: `${state.room.roomId}:${message.scope}`
+  });
+  notification.addEventListener("click", () => {
+    window.focus();
+    notification.close();
+  });
+}
+
+function notifyRoomEvent(state: Runtime, title: string, body: string, tag: string): void {
+  const now = Date.now();
+  if (now - state.lastNotificationAt < NOTIFICATION_THROTTLE_MS) {
+    return;
+  }
+  state.lastNotificationAt = now;
+  if (state.soundEnabled) {
+    playNotificationSound();
+  }
+  if (!state.notificationsEnabled || notificationPermission() !== "granted" || isWindowActive()) {
+    return;
+  }
+  const notification = new Notification(title, {
+    body,
+    tag: `${state.room.roomId}:${tag}`
   });
   notification.addEventListener("click", () => {
     window.focus();
@@ -3881,11 +3945,11 @@ function playDecodedAudio(participant: CallParticipant, audioData: AudioDataLike
   audioData.close();
 }
 
-async function sendTextMessage(text: string): Promise<void> {
+async function sendTextMessage(text: string): Promise<boolean> {
   const state = runtime;
   const message = text.trim();
   if (!state || !message) {
-    return;
+    return true;
   }
   const delivery = currentDeliveryContext(state);
   const textPayload: PlainPayload = {
@@ -3909,10 +3973,13 @@ async function sendTextMessage(text: string): Promise<void> {
   if (delivery.targets.length > 0 && !sent) {
     state.draftText = text;
     addSystemMessage("当前连接未就绪，消息未发送。");
-    return;
+    return false;
   }
   pushMessage(state, ownMessage);
-  renderChat({ forceScrollToBottom: true });
+  if (!appendMessageToRenderedList(state, ownMessage, true)) {
+    renderChat({ forceScrollToBottom: true });
+  }
+  return true;
 }
 
 async function sendImageBlob(blob: Blob, fallbackName: string): Promise<void> {
@@ -4494,14 +4561,69 @@ function renderComposer(state: Runtime): HTMLElement {
     ariaLabel: "发送"
   });
   send.type = "submit";
+  let sendingText = false;
+  const keepComposerFocus = (event: Event) => {
+    if (document.activeElement === input) {
+      event.preventDefault();
+    }
+  };
+  const submitComposer = () => {
+    if (sendingText) {
+      return;
+    }
+    const value = input.value;
+    if (!value.trim()) {
+      input.focus({ preventScroll: true });
+      return;
+    }
+    const shouldRestoreFocus = document.activeElement === input;
+    input.value = "";
+    state.draftText = "";
+    syncInputHeight();
+    emojiPanel.classList.remove("open");
+    sendingText = true;
+    send.disabled = true;
+    void sendTextMessage(value)
+      .then((sent) => {
+        if (sent) {
+          return;
+        }
+        const current = runtime;
+        if (current) {
+          current.draftText = value;
+        }
+        input.value = value;
+        syncInputHeight();
+        input.setSelectionRange(value.length, value.length);
+      })
+      .catch(() => {
+        const current = runtime;
+        if (current) {
+          current.draftText = value;
+          addSystemMessage("消息发送失败，已保留输入内容。");
+        }
+        input.value = value;
+        syncInputHeight();
+        input.setSelectionRange(value.length, value.length);
+      })
+      .finally(() => {
+        sendingText = false;
+        send.disabled = false;
+        if (shouldRestoreFocus && document.contains(input)) {
+          input.focus({ preventScroll: true });
+        }
+      });
+  };
+  send.addEventListener("pointerdown", keepComposerFocus);
+  send.addEventListener("mousedown", keepComposerFocus);
   input.addEventListener("input", syncInputHeight);
   input.addEventListener("input", () => {
     state.draftText = input.value;
   });
   input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
-      send.click();
+      submitComposer();
     }
   });
   input.addEventListener("paste", (event) => {
@@ -4519,22 +4641,7 @@ function renderComposer(state: Runtime): HTMLElement {
   });
   composer.addEventListener("submit", (event) => {
     event.preventDefault();
-    const value = input.value;
-    input.value = "";
-    state.draftText = "";
-    syncInputHeight();
-    emojiPanel.classList.remove("open");
-    void sendTextMessage(value)
-      .catch(() => {
-        const state = runtime;
-        if (state) {
-          state.draftText = value;
-          addSystemMessage("消息发送失败，已保留输入内容。");
-        }
-      })
-      .finally(() => {
-        focusComposerInput();
-      });
+    submitComposer();
   });
   composerPill.append(emojiWrap, input, attach, fileInput);
   composer.append(composerPill, send);
