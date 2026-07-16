@@ -61,7 +61,7 @@ export class WsClient {
       this.handlers.close();
       if (!this.#closed) {
         this.handlers.status("已断开，正在重连");
-        const delay = Math.min(500 * 2 ** this.#attempt, 5_000);
+        const delay = Math.min(500 * 2 ** Math.min(this.#attempt, 20), 5_000);
         this.#attempt += 1;
         this.#reconnectTimer = window.setTimeout(() => {
           this.#reconnectTimer = null;

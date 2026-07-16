@@ -4848,6 +4848,37 @@ function renderChat(options: RenderChatOptions = {}): void {
     messages,
     renderComposer(state)
   );
+  let dragCounter = 0;
+  main.addEventListener("dragover", (event) => {
+    if (event.dataTransfer?.types.includes("Files")) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+      main.classList.add("drag-over");
+    }
+  });
+  main.addEventListener("dragenter", (event) => {
+    if (event.dataTransfer?.types.includes("Files")) {
+      event.preventDefault();
+      dragCounter += 1;
+      main.classList.add("drag-over");
+    }
+  });
+  main.addEventListener("dragleave", () => {
+    dragCounter -= 1;
+    if (dragCounter <= 0) {
+      dragCounter = 0;
+      main.classList.remove("drag-over");
+    }
+  });
+  main.addEventListener("drop", (event) => {
+    dragCounter = 0;
+    main.classList.remove("drag-over");
+    const files = event.dataTransfer?.files;
+    if (files && files.length > 0) {
+      event.preventDefault();
+      void sendFiles([...files]);
+    }
+  });
   layout.append(renderSidebar(state), main);
   const callLayer = renderCallLayer(state);
   if (callLayer) {

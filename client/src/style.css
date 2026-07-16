@@ -1881,3 +1881,23 @@ textarea:disabled {
     padding: 0 10px;
   }
 }
+
+.chat-main {
+  position: relative;
+}
+
+.chat-main.drag-over::after {
+  content: "拖拽文件到此处发送";
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(40, 168, 232, 0.12);
+  border: 2px dashed #28a8e8;
+  border-radius: 12px;
+  z-index: 50;
+  font-size: 18px;
+  font-weight: 600;
+  color: #168ac7;
+  pointer-events: none;
+}

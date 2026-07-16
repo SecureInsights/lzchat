@@ -6,7 +6,7 @@ const STRICT_CSP = [
   "style-src 'self'",
   "img-src 'self' data: blob:",
   "font-src 'self'",
-  "connect-src 'self' wss:",
+  "connect-src 'self'",
   "object-src 'none'",
   "base-uri 'none'",
   "frame-ancestors 'none'",
@@ -15,6 +15,7 @@ const STRICT_CSP = [
 
 export const SECURITY_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
   "Referrer-Policy": "no-referrer",
   "Permissions-Policy": "camera=(self), microphone=(self), geolocation=()",
   "Cross-Origin-Opener-Policy": "same-origin",
@@ -29,7 +30,7 @@ export function applySecurityHeaders(
   for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
     if (name === "Content-Security-Policy") {
       const csp = options.allowInsecureWebSocket
-        ? value.replace("connect-src 'self' wss:", "connect-src 'self' ws: wss:")
+        ? value.replace("connect-src 'self'", "connect-src 'self' ws: wss:")
         : value;
       res.setHeader(name, options.upgradeInsecureRequests ? `${csp}; upgrade-insecure-requests` : csp);
     } else {

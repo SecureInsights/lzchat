@@ -57,6 +57,8 @@ export const MAX_BAD_MESSAGES = 8;
 export const CLIENT_TIMEOUT_MS = 90_000;
 export const JOIN_TIMEOUT_MS = 10_000;
 export const MAX_CALL_MEDIA_CT_CHARS = 384 * 1024;
+export const MAX_ROOMS = 10_000;
+export const MAX_PENDING_SOCKETS_PER_ROOM = 16;
 
 export const ROOM_ID_RE = /^[A-Za-z0-9_-]{16,64}$/u;
 export const CLIENT_ID_RE = /^[A-Za-z0-9_-]{16,128}$/u;

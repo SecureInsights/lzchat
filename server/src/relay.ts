@@ -9,6 +9,8 @@ import {
   MAX_MESSAGES_PER_WINDOW,
   MAX_RELAY_SIZE,
   MAX_ROOM_MEMBERS,
+  MAX_ROOMS,
+  MAX_PENDING_SOCKETS_PER_ROOM,
   RATE_WINDOW_MS,
   JOIN_TIMEOUT_MS,
   isValidRoomId,
@@ -197,6 +199,11 @@ class Room {
   attach(socket: WebSocketPeer): void {
     let state: ClientState | null = null;
     this.#sockets += 1;
+    if (this.#sockets > MAX_PENDING_SOCKETS_PER_ROOM + MAX_ROOM_MEMBERS) {
+      this.#sockets -= 1;
+      socket.close(1013, "too_many_sockets");
+      return;
+    }
     const joinDeadline = setTimeout(() => {
       if (!state) {
         socket.close(1008, "join_timeout");
@@ -289,6 +296,7 @@ class Room {
       this.bad(state);
       return;
     }
+    state.badMessages = 0;
     this.clients.get(relay.to)?.socket.sendText(JSON.stringify(relay));
   }
 
@@ -358,6 +366,11 @@ class Room {
 }
 
 export class RelayHub {
+  #allowedOrigins: readonly string[];
+
+  constructor(allowedOrigins: readonly string[] = []) {
+    this.#allowedOrigins = allowedOrigins;
+  }
   #rooms = new Map<string, Room>();
 
   handleUpgrade(req: IncomingMessage, socket: Duplex): void {
@@ -372,6 +385,14 @@ export class RelayHub {
       socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
+    }
+    if (this.#allowedOrigins.length > 0) {
+      const origin = req.headers.origin;
+      if (!origin || !this.#allowedOrigins.includes(origin)) {
+        socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
     }
     const key = req.headers["sec-websocket-key"];
     const version = req.headers["sec-websocket-version"];
@@ -401,6 +422,11 @@ export class RelayHub {
     const peer = new WebSocketPeer(socket);
     let room = this.#rooms.get(roomId);
     if (!room) {
+      if (this.#rooms.size >= MAX_ROOMS) {
+        socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
       room = new Room(roomId, (emptyRoomId) => this.#rooms.delete(emptyRoomId));
       this.#rooms.set(roomId, room);
     }

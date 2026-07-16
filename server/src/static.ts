@@ -32,6 +32,7 @@ function safePath(distDir: string, pathname: string): string | null {
   let decoded: string;
   try {
     decoded = decodeURIComponent(pathname);
+    if (decoded.includes("\0") || decoded.includes("..")) return null;
   } catch {
     return null;
   }

@@ -149,7 +149,7 @@ function defaultInviteSecret(roomSeed: string): InviteSecret {
     v: 3,
     roomSeed,
     createdAt: Date.now(),
-    expiresAt: null,
+    expiresAt: Date.now() + 4 * 60 * 1000,
     maxMembers: 16,
     features: {
       files: true,
