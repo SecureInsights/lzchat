@@ -43,6 +43,7 @@ import type {
 import { validateRelayEnvelope } from "./protocol/validator";
 import { safeDownload } from "./security/download";
 import { el, removeChildren, setDataset } from "./security/safe-dom";
+import { loadCachedDisplayName, saveCachedDisplayName } from "./storage";
 import { WsClient } from "./transport/ws-client";
 
 type PeerRuntime = {
@@ -58,6 +59,7 @@ type PeerRuntime = {
   mediaRecvRatchet: ReceiveRatchet;
   fingerprint: string;
   profileSent: boolean;
+  pendingJoinAnnounce: boolean;
   messageWindow: number[];
   mediaMessageWindow: number[];
   mediaByteWindow: Array<{ seenAt: number; bytes: number }>;
@@ -1576,7 +1578,10 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       clientId: member.clientId,
       sessionPub: member.sessionPub,
       connectionEpoch: member.connectionEpoch,
-      displayName: previousDisplayName ?? `临时成员 ${member.clientId.slice(0, 4)}`,
+      displayName:
+        previousDisplayName ??
+        loadCachedDisplayName(state.room.roomId, member.sessionPub) ??
+        `临时成员 ${member.clientId.slice(0, 4)}`,
       capabilities: member.capabilities,
       pair,
       sendRatchet,
@@ -1585,6 +1590,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       mediaRecvRatchet,
       fingerprint: "计算中",
       profileSent: false,
+      pendingJoinAnnounce: false,
       messageWindow: previousMessageWindow,
       mediaMessageWindow: previousMediaMessageWindow,
       mediaByteWindow: previousMediaByteWindow,
@@ -1594,15 +1600,8 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       lastFailureNoticeAt: 0
     };
     state.peers.set(member.clientId, peerState);
-    if (isNewPeer && shouldNotifyMembershipChanges) {
-      addSystemMessage(`${peerState.displayName} 已加入房间。`);
-      notifyRoomEvent(
-        state,
-        `${peerState.displayName} 已加入房间`,
-        "成员加入了当前房间。",
-        "membership"
-      );
-    }
+    // 加入播报延迟到 profile（真实昵称）到达后再发，见 handleRelay 的 profile 分支。
+    peerState.pendingJoinAnnounce = isNewPeer && shouldNotifyMembershipChanges;
     if (wasPrivateTarget) {
       state.privatePeerId = member.clientId;
     }
@@ -1733,6 +1732,12 @@ async function handleRelay(envelope: RelayEnvelope, allowQueue = true): Promise<
   }
   if (payload.type === "profile") {
     peer.displayName = payload.displayName || peer.displayName;
+    saveCachedDisplayName(state.room.roomId, peer.sessionPub, peer.displayName);
+    if (peer.pendingJoinAnnounce) {
+      peer.pendingJoinAnnounce = false;
+      addSystemMessage(`${peer.displayName} 已加入房间。`);
+      notifyRoomEvent(state, `${peer.displayName} 已加入房间`, "成员加入了当前房间。", "membership");
+    }
     if (payload.roomName && state.roomName === DEFAULT_ROOM_NAME) {
       state.roomName = payload.roomName;
     }
