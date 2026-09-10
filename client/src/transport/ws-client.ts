@@ -10,6 +10,21 @@ export type WsClientHandlers = {
 
 const PONG_WATCHDOG_MS = 10_000;
 const MAX_OUTBOX = 64;
+// 蜂窝网络 NAT/运营商网关空闲超时可能短于 60s，心跳间隔收紧以保活。
+const HEARTBEAT_MS_DESKTOP = 25_000;
+const HEARTBEAT_MS_MOBILE = 15_000;
+
+function isLikelyMobile(): boolean {
+  const connection = (navigator as { connection?: { type?: string } }).connection;
+  if (connection?.type === "cellular") {
+    return true;
+  }
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+}
+
+function heartbeatIntervalMs(): number {
+  return isLikelyMobile() ? HEARTBEAT_MS_MOBILE : HEARTBEAT_MS_DESKTOP;
+}
 
 export class WsClient {
   #socket: WebSocket | null = null;
@@ -91,7 +106,9 @@ export class WsClient {
       this.handlers.close();
       if (!this.#closed) {
         this.handlers.status("已断开，正在重连");
-        const delay = Math.min(500 * 2 ** Math.min(this.#attempt, 20), 5_000);
+        // ±30% 随机抖动，避免服务器恢复瞬间的重连惊群。
+        const base = Math.min(500 * 2 ** Math.min(this.#attempt, 20), 5_000);
+        const delay = Math.round(base * (0.7 + Math.random() * 0.6));
         this.#attempt += 1;
         this.#reconnectTimer = window.setTimeout(() => {
           this.#reconnectTimer = null;
@@ -210,7 +227,7 @@ export class WsClient {
       if (this.send(ping)) {
         this.armPongWatchdog();
       }
-    }, 25_000);
+    }, heartbeatIntervalMs());
   }
 
   private stopHeartbeat(): void {

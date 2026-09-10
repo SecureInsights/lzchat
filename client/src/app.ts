@@ -89,6 +89,8 @@ type ChatMessage = {
   /** 0-1 为传输中进度；<0 表示发送失败；缺省表示已完成。 */
   fileProgress?: number;
   peerName?: string;
+  /** 渲染脏位：消息被原地修改（进度/状态变化）时标记，增量同步时只重建对应行。 */
+  renderDirty?: boolean;
 };
 
 type CallMediaKind = "audio" | "video";
@@ -99,7 +101,7 @@ type CallParticipantStatus = "ringing" | "connecting" | "active" | "ended";
 type CallSignalPayload = Extract<PlainPayload, { type: "call-offer" | "call-answer" | "call-end" }>;
 type CallEndPayload = Extract<PlainPayload, { type: "call-end" }>;
 type CallMediaPayload = Extract<PlainPayload, { type: "call-media" }>;
-type CallControlPayload = CallEndPayload;
+type CallControlPayload = Extract<PlainPayload, { type: "call-end" | "call-quality" }>;
 type EncodedChunkType = "key" | "delta";
 
 type EncodedChunkLike = {
@@ -280,6 +282,9 @@ type EncodedCallReceiver = {
   nextAudioTime: number;
   seenVideoSeq: Set<number>;
   seenAudioSeq: Set<number>;
+  /** 音频 jitter buffer：解码帧先蓄水，播放链落后时攒够再重排，消除网络抖动断续。 */
+  audioPending: Array<{ buffer: AudioBuffer; seconds: number }>;
+  audioPendingSeconds: number;
 };
 
 type CallParticipant = {
@@ -290,6 +295,10 @@ type CallParticipant = {
   remoteCanvas: HTMLCanvasElement | null;
   audioLevel: number;
   audioLevelAt: number;
+  /** 当前回报窗口内累计丢弃的视频帧数（拥塞反馈统计）。 */
+  droppedVideoFrames: number;
+  /** 统计窗口起始时间戳。 */
+  droppedWindowStart: number;
 };
 
 type CallVideoProfile = {
@@ -321,6 +330,12 @@ type CallRuntime = {
   localAudioLevelAt: number;
   audioIndicatorFrameId: number | null;
   audioIndicatorDecayTimerId: number | null;
+  /** 拥塞反馈档位：0 基准，1/2 降档（fps/码率上限收紧）。 */
+  videoQualityTier: number;
+  /** 连续健康回报计数，达到阈值后回升一档。 */
+  videoQualityHealthySamples: number;
+  /** 接收端拥塞统计回报定时器。 */
+  qualityReportTimerId: number | null;
   createdAt: number;
 };
 
@@ -428,6 +443,15 @@ if (pendingInviteToken) {
 let runtime: Runtime | null = null;
 let notificationAudioContext: AudioContext | null = null;
 const MAX_RENDERED_MESSAGES = 500;
+// 持久消息列表：.messages 容器跨 renderChat 调用复用，行按消息 id 对账——
+// 新消息只追加尾部、原地修改的行只重建该行、头部按 MAX_RENDERED_MESSAGES 修剪，
+// 避免每次全量重建数百行 DOM 与滚动位置重置。
+let messagesContainer: HTMLElement | null = null;
+let messagesContainerState: Runtime | null = null;
+// 行→消息 id 映射（用 WeakMap 而非 dataset：消息 id 含 ":"，超出 setDataset 的取值规则）。
+const messageRowIds = new WeakMap<HTMLElement, string>();
+// 消息→当前行元素映射：传输进度更新时直接改写对应气泡的进度条，无需重建整条消息列表。
+const messageRows = new WeakMap<ChatMessage, HTMLElement>();
 const PEER_MESSAGE_WINDOW_MS = 10_000;
 const PEER_MAX_MESSAGES_PER_WINDOW = 120;
 const FAILURE_NOTICE_INTERVAL_MS = 5_000;
@@ -443,6 +467,15 @@ const CALL_MAX_VIDEO_CHUNK_BYTES = 192 * 1024;
 const CALL_MAX_AUDIO_CHUNK_BYTES = 16 * 1024;
 const CALL_MAX_MEDIA_SEND_FAILURES = 8;
 const CALL_MAX_AUDIO_QUEUE_DELAY_SEC = 0.8;
+// 音频 jitter buffer：欠载后蓄水 100ms 再起播；pending 队列上限 1s，过载丢弃最旧帧。
+const CALL_AUDIO_JITTER_FILL_SECONDS = 0.1;
+const CALL_AUDIO_JITTER_MAX_SECONDS = 1.0;
+// 视频拥塞反馈（简化 REMB）：接收端 2s 窗口统计丢帧率/解码队列，经 call-control 回传；
+// 拥塞时发送端升 tier（降码率档）并立即强制关键帧，连续 3 个健康窗口回升一档。
+const CALL_QUALITY_REPORT_INTERVAL_MS = 2_000;
+const CALL_QUALITY_RECOVERY_SAMPLES = 3;
+const CALL_QUALITY_DROP_FPS_THRESHOLD = 1;
+const CALL_QUALITY_QUEUE_THRESHOLD = 8;
 const CALL_INCOMING_TIMEOUT_MS = 60_000;
 const CALL_RINGTONE_INTERVAL_MS = 1_700;
 const CALL_CONTROL_REPLAY_WINDOW = 256;
@@ -451,12 +484,9 @@ const CALL_SPEAKING_LEVEL = 0.035;
 const CALL_SPEAKING_HOLD_MS = 620;
 const MAX_INLINE_IMAGE_BYTES = 3 * 1024 * 1024;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
-const FILE_PROGRESS_RENDER_INTERVAL_MS = 300;
 const MAX_FILE_BATCH = 10;
 const MAX_FILE_BATCH_BYTES = 100 * 1024 * 1024;
 const FILE_CHUNK_BYTES = 256 * 1024;
-// 接收进度渲染节流：分片到达很密，不必每片都重建消息列表。
-let incomingProgressLastRenderAt = 0;
 const FILE_RECEIVE_TIMEOUT_MS = 2 * 60 * 1000;
 const MAX_INCOMING_FILES_PER_PEER = 3;
 const MAX_INCOMING_FILES_TOTAL = 12;
@@ -469,6 +499,9 @@ const DANGEROUS_DOWNLOAD_MIME_RE =
 const PEER_MAX_CALL_MEDIA_MESSAGES_PER_WINDOW = 2_000;
 const CALL_MEDIA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
 const CALL_MEDIA_BUFFER_CRITICAL_BYTES = 768 * 1024;
+// 文件分片发送背压：WS 发送缓冲高于高水位才等待排空，低网络压力时不再固定 sleep。
+const FILE_BACKPRESSURE_HIGH_WATER_BYTES = 4 * 1024 * 1024;
+const FILE_BACKPRESSURE_MAX_WAIT_MS = 60_000;
 const CALL_VIDEO_ENCODER_QUEUE_LIMIT = 2;
 const CALL_MAX_ROOM_TARGETS = 8;
 const CALL_VIDEO_BASE_WIDTH = 640;
@@ -774,6 +807,19 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+async function waitFileBackpressure(state: Runtime): Promise<void> {
+  if (state.ws.bufferedAmount() < FILE_BACKPRESSURE_HIGH_WATER_BYTES) {
+    return;
+  }
+  const waitStart = Date.now();
+  while (state.ws.bufferedAmount() >= FILE_BACKPRESSURE_HIGH_WATER_BYTES) {
+    if (Date.now() - waitStart > FILE_BACKPRESSURE_MAX_WAIT_MS) {
+      break;
+    }
+    await delay(100);
+  }
+}
+
 async function loadEmojiData(): Promise<EmojiRecord[]> {
   if (!emojiDataPromise) {
     emojiDataPromise = fetch(emojiDataUrl, {
@@ -972,6 +1018,8 @@ function destroyRuntime(): void {
   }
   state.messages.splice(0);
   runtime = null;
+  messagesContainer = null;
+  messagesContainerState = null;
 }
 
 /**
@@ -1130,6 +1178,7 @@ function deleteIncomingFile(state: Runtime, key: string): void {
     );
     if (placeholder) {
       placeholder.fileProgress = -1;
+      placeholder.renderDirty = true;
       renderChat();
     }
   }
@@ -1720,7 +1769,11 @@ async function handleRelay(envelope: RelayEnvelope, allowQueue = true): Promise<
   if (envelope.kind === "call-control") {
     const control = await openCallControlEnvelope(envelope, peer);
     if (control && acceptCallControl(peer, envelope.seq, control.createdAt)) {
-      await handleCallSignal(state, peer, control);
+      if (control.type === "call-quality") {
+        handleCallQuality(state, peer, control);
+      } else {
+        await handleCallSignal(state, peer, control);
+      }
     }
     return;
   }
@@ -1947,11 +2000,7 @@ function handleFileChunk(
   );
   if (placeholder) {
     placeholder.fileProgress = incoming.size > 0 ? incoming.receivedBytes / incoming.size : 0;
-    const now = Date.now();
-    if (now - incomingProgressLastRenderAt > FILE_PROGRESS_RENDER_INTERVAL_MS) {
-      incomingProgressLastRenderAt = now;
-      renderChat();
-    }
+    updateFileProgressRow(placeholder, placeholder.fileProgress);
   }
 }
 
@@ -2003,6 +2052,8 @@ async function handleFileDone(
   );
   if (placeholderIndex >= 0) {
     state.messages[placeholderIndex] = message;
+    // 占位行与完成行的 DOM 结构不同（进度条 → 下载按钮），强制原位重建。
+    message.renderDirty = true;
   } else {
     pushMessage(state, message);
   }
@@ -2338,7 +2389,9 @@ function createEncodedReceiver(): EncodedCallReceiver {
     gotVideoKeyFrame: false,
     nextAudioTime: 0,
     seenVideoSeq: new Set(),
-    seenAudioSeq: new Set()
+    seenAudioSeq: new Set(),
+    audioPending: [],
+    audioPendingSeconds: 0
   };
 }
 
@@ -2350,7 +2403,9 @@ function createCallParticipant(peer: PeerRuntime, status: CallParticipantStatus)
     receiver: createEncodedReceiver(),
     remoteCanvas: null,
     audioLevel: 0,
-    audioLevelAt: 0
+    audioLevelAt: 0,
+    droppedVideoFrames: 0,
+    droppedWindowStart: 0
   };
 }
 
@@ -2422,29 +2477,48 @@ function hasLiveCallParticipants(call: CallRuntime): boolean {
   return [...call.participants.values()].some((participant) => participant.status !== "ended");
 }
 
+// 拥塞降档上限：tier 0 不限制，1/2 收紧帧率与码率档（分辨率不变，避免重配解码器）。
+const CALL_VIDEO_QUALITY_TIERS = [
+  { fpsCap: 0, bitrateCap: 0 },
+  { fpsCap: 15, bitrateCap: 600_000 },
+  { fpsCap: 10, bitrateCap: 400_000 }
+];
+
 function callVideoProfile(call: CallRuntime): CallVideoProfile {
   const fanout = Math.max(1, call.participants.size || call.targetIds.length);
-  if (call.scope === "room" && fanout >= 5) {
-    return {
-      width: CALL_VIDEO_CROWDED_WIDTH,
-      height: CALL_VIDEO_CROWDED_HEIGHT,
-      fps: CALL_VIDEO_CROWDED_FPS,
-      bitrates: CALL_VIDEO_CROWDED_BITRATES
-    };
+  const base: CallVideoProfile =
+    call.scope === "room" && fanout >= 5
+      ? {
+          width: CALL_VIDEO_CROWDED_WIDTH,
+          height: CALL_VIDEO_CROWDED_HEIGHT,
+          fps: CALL_VIDEO_CROWDED_FPS,
+          bitrates: CALL_VIDEO_CROWDED_BITRATES
+        }
+      : call.scope === "room" && fanout >= 3
+        ? {
+            width: CALL_VIDEO_ROOM_WIDTH,
+            height: CALL_VIDEO_ROOM_HEIGHT,
+            fps: CALL_VIDEO_ROOM_FPS,
+            bitrates: CALL_VIDEO_ROOM_BITRATES
+          }
+        : {
+            width: CALL_VIDEO_BASE_WIDTH,
+            height: CALL_VIDEO_BASE_HEIGHT,
+            fps: CALL_VIDEO_BASE_FPS,
+            bitrates: CALL_VIDEO_BASE_BITRATES
+          };
+  const tier =
+    CALL_VIDEO_QUALITY_TIERS[
+      Math.max(0, Math.min(CALL_VIDEO_QUALITY_TIERS.length - 1, call.videoQualityTier | 0))
+    ]!;
+  if (tier.fpsCap === 0 || tier.bitrateCap === 0) {
+    return base;
   }
-  if (call.scope === "room" && fanout >= 3) {
-    return {
-      width: CALL_VIDEO_ROOM_WIDTH,
-      height: CALL_VIDEO_ROOM_HEIGHT,
-      fps: CALL_VIDEO_ROOM_FPS,
-      bitrates: CALL_VIDEO_ROOM_BITRATES
-    };
-  }
+  const capped = base.bitrates.filter((bitrate) => bitrate <= tier.bitrateCap);
   return {
-    width: CALL_VIDEO_BASE_WIDTH,
-    height: CALL_VIDEO_BASE_HEIGHT,
-    fps: CALL_VIDEO_BASE_FPS,
-    bitrates: CALL_VIDEO_BASE_BITRATES
+    ...base,
+    fps: Math.min(base.fps, tier.fpsCap),
+    bitrates: capped.length > 0 ? capped : [base.bitrates[base.bitrates.length - 1]!]
   };
 }
 
@@ -2469,25 +2543,43 @@ function callQualityText(call: CallRuntime): string {
   return `端到端加密媒体流 · WebSocket 中继 · ${profile.width}x${profile.height} · ${fps}fps`;
 }
 
+// 音量检测缓冲复用：避免每帧分配 Float32Array。
+let audioLevelBufCache = new Float32Array(0);
+let playAudioLevelBufCache = new Float32Array(0);
+
 function audioDataLevel(audioData: AudioDataLike): number {
   const channels = Math.max(1, Math.min(audioData.numberOfChannels, 2));
   let sum = 0;
   let samples = 0;
   for (let channel = 0; channel < channels; channel += 1) {
-    const target = new Float32Array(audioData.numberOfFrames);
+    const target = getAudioLevelBuffer(audioData.numberOfFrames, 0);
     try {
       audioData.copyTo(target, { planeIndex: channel, format: "f32-planar" });
     } catch {
       audioData.copyTo(target, { planeIndex: channel });
     }
     const step = Math.max(1, Math.floor(target.length / 1024));
-    for (let index = 0; index < target.length; index += step) {
+    for (let index = 0; index < audioData.numberOfFrames; index += step) {
       const value = target[index] ?? 0;
       sum += value * value;
       samples += 1;
     }
   }
   return samples > 0 ? Math.sqrt(sum / samples) : 0;
+}
+
+function getAudioLevelBuffer(frames: number, which: 0 | 1): Float32Array {
+  // 缓存长度足够则原地复用（copyTo 覆盖前 frames 项即可），否则重新分配。
+  if (which === 0) {
+    if (audioLevelBufCache.length < frames) {
+      audioLevelBufCache = new Float32Array(Math.max(frames, 2048));
+    }
+    return audioLevelBufCache.subarray(0, frames);
+  }
+  if (playAudioLevelBufCache.length < frames) {
+    playAudioLevelBufCache = new Float32Array(Math.max(frames, 2048));
+  }
+  return playAudioLevelBufCache.subarray(0, frames);
 }
 
 function rememberCallAudioLevel(call: CallRuntime, speakerId: string, level: number): void {
@@ -2593,16 +2685,140 @@ function isCallControlPayload(value: unknown): value is CallControlPayload {
     return false;
   }
   const payload = value as Record<string, unknown>;
-  return (
-    payload.type === "call-end" &&
+  const validBase =
     typeof payload.callId === "string" &&
     /^[A-Za-z0-9_-]{1,128}$/u.test(payload.callId) &&
-    (payload.reason === undefined ||
-      (typeof payload.reason === "string" && payload.reason.length <= 120)) &&
     typeof payload.createdAt === "number" &&
     Number.isSafeInteger(payload.createdAt) &&
-    payload.createdAt > 0
-  );
+    payload.createdAt > 0;
+  if (!validBase) {
+    return false;
+  }
+  if (payload.type === "call-end") {
+    return (
+      payload.reason === undefined ||
+      (typeof payload.reason === "string" && payload.reason.length <= 120)
+    );
+  }
+  if (payload.type === "call-quality") {
+    const droppedFpsOk =
+      payload.droppedFps === undefined ||
+      (typeof payload.droppedFps === "number" &&
+        payload.droppedFps >= 0 &&
+        payload.droppedFps <= 120);
+    const queueOk =
+      payload.decodeQueue === undefined ||
+      (typeof payload.decodeQueue === "number" &&
+        Number.isSafeInteger(payload.decodeQueue) &&
+        payload.decodeQueue >= 0 &&
+        payload.decodeQueue <= 256);
+    return droppedFpsOk && queueOk;
+  }
+  return false;
+}
+
+function noteVideoFrameDrop(participant: CallParticipant): void {
+  participant.droppedVideoFrames += 1;
+}
+
+function startCallQualityReporting(state: Runtime, call: CallRuntime): void {
+  stopCallQualityReporting(call);
+  call.qualityReportTimerId = window.setInterval(() => {
+    if (runtime !== state || state.call !== call || call.media !== "video") {
+      return;
+    }
+    reportCallQuality(state, call);
+  }, CALL_QUALITY_REPORT_INTERVAL_MS);
+}
+
+function stopCallQualityReporting(call: CallRuntime): void {
+  if (call.qualityReportTimerId !== null) {
+    window.clearInterval(call.qualityReportTimerId);
+    call.qualityReportTimerId = null;
+  }
+}
+
+function reportCallQuality(state: Runtime, call: CallRuntime): void {
+  const now = Date.now();
+  for (const participant of call.participants.values()) {
+    if (participant.status !== "active") {
+      continue;
+    }
+    const peer = state.peers.get(participant.peerId);
+    if (!peer) {
+      continue;
+    }
+    const windowMs = Math.max(
+      1,
+      now - (participant.droppedWindowStart > 0 ? participant.droppedWindowStart : now)
+    );
+    const droppedFps = (participant.droppedVideoFrames * 1000) / windowMs;
+    participant.droppedVideoFrames = 0;
+    participant.droppedWindowStart = now;
+    const payload: Extract<PlainPayload, { type: "call-quality" }> = {
+      type: "call-quality",
+      callId: call.callId,
+      droppedFps: Math.round(droppedFps * 10) / 10,
+      decodeQueue: participant.receiver.videoDecoder?.decodeQueueSize ?? 0,
+      createdAt: now
+    };
+    void sendCallControlSignal(state, peer, payload).catch(() => undefined);
+  }
+}
+
+function handleCallQuality(
+  state: Runtime,
+  peer: PeerRuntime,
+  payload: Extract<PlainPayload, { type: "call-quality" }>
+): void {
+  const call = state.call;
+  if (
+    !call ||
+    call.callId !== payload.callId ||
+    call.media !== "video" ||
+    !callHasParticipant(call, peer.clientId)
+  ) {
+    return;
+  }
+  if (!call.publisher || !call.publisher.videoEncoder) {
+    return;
+  }
+  const maxTier = CALL_VIDEO_QUALITY_TIERS.length - 1;
+  const congested =
+    (payload.droppedFps ?? 0) > CALL_QUALITY_DROP_FPS_THRESHOLD ||
+    (payload.decodeQueue ?? 0) > CALL_QUALITY_QUEUE_THRESHOLD;
+  if (congested) {
+    call.videoQualityHealthySamples = 0;
+    if (call.videoQualityTier < maxTier) {
+      call.videoQualityTier += 1;
+      void reconfigureCallVideo(state, call);
+    }
+  } else {
+    call.videoQualityHealthySamples += 1;
+    if (call.videoQualityHealthySamples >= CALL_QUALITY_RECOVERY_SAMPLES && call.videoQualityTier > 0) {
+      call.videoQualityTier -= 1;
+      call.videoQualityHealthySamples = 0;
+      void reconfigureCallVideo(state, call);
+    }
+  }
+}
+
+async function reconfigureCallVideo(state: Runtime, call: CallRuntime): Promise<void> {
+  const publisher = call.publisher;
+  if (!publisher || !publisher.videoEncoder) {
+    return;
+  }
+  try {
+    const config = await selectVideoConfig(call);
+    publisher.videoConfig = config;
+    publisher.videoEncoder.configure(config);
+    // 立即强制关键帧：下一帧走 key 路径，对端可快速同步新的编码参数，
+    // 避免等待 2s 关键帧周期导致画面冻结。
+    publisher.lastKeyFrameAt = 0;
+    publisher.lastVideoEncodeAt = 0;
+  } catch {
+    // 重配失败时保留原配置，继续按旧参数发送。
+  }
 }
 
 function cleanupCall(call: CallRuntime | null): void {
@@ -2610,6 +2826,7 @@ function cleanupCall(call: CallRuntime | null): void {
     return;
   }
   stopCallRingtone(call);
+  stopCallQualityReporting(call);
   if (call.incomingTimerId !== null) {
     window.clearTimeout(call.incomingTimerId);
     call.incomingTimerId = null;
@@ -2687,6 +2904,15 @@ function callVideoConstraints(): MediaTrackConstraints {
   };
 }
 
+function callAudioConstraints(): MediaTrackConstraints {
+  return {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    channelCount: 1
+  };
+}
+
 async function queryMediaPermission(name: "microphone" | "camera"): Promise<MediaPermissionState> {
   const permissions = navigator.permissions;
   if (!permissions?.query) {
@@ -2727,19 +2953,20 @@ async function getCallMedia(media: CallMediaKind): Promise<CallMediaGrant> {
   }
   if (media === "audio") {
     return {
-      stream: await requestMediaWithFallback({ audio: true, video: false }, [
-        { audio: { echoCancellation: true }, video: false }
-      ])
+      stream: await requestMediaWithFallback(
+        { audio: callAudioConstraints(), video: false },
+        [{ audio: { echoCancellation: true }, video: false }]
+      )
     };
   }
   try {
     return {
       stream: await requestMediaWithFallback(
         {
-          audio: true,
+          audio: callAudioConstraints(),
           video: callVideoConstraints()
         },
-        [{ audio: true, video: true }]
+        [{ audio: callAudioConstraints(), video: true }]
       )
     };
   } catch (error) {
@@ -3106,6 +3333,9 @@ async function startOutgoingCall(
     localAudioLevelAt: 0,
     audioIndicatorFrameId: null,
     audioIndicatorDecayTimerId: null,
+    videoQualityTier: 0,
+    videoQualityHealthySamples: 0,
+    qualityReportTimerId: null,
     createdAt: Date.now()
   };
   for (const target of targets) {
@@ -3310,6 +3540,9 @@ async function handleCallSignal(
       localAudioLevelAt: 0,
       audioIndicatorFrameId: null,
       audioIndicatorDecayTimerId: null,
+      videoQualityTier: 0,
+      videoQualityHealthySamples: 0,
+      qualityReportTimerId: null,
       createdAt: payload.createdAt
     };
     state.privatePeerId = scope === "private" ? peer.clientId : null;
@@ -3458,6 +3691,10 @@ async function startEncodedPublisher(state: Runtime, call: CallRuntime): Promise
     cleanupEncodedPublisher(publisher);
     call.publisher = null;
     throw new Error("No supported media encoder");
+  }
+  if (call.media === "video") {
+    // 接收端拥塞统计回报：每 2s 向正在解码的对端发送 call-quality 反馈。
+    startCallQualityReporting(state, call);
   }
 }
 
@@ -3786,20 +4023,30 @@ function cleanupEncodedReceiver(receiver: EncodedCallReceiver): void {
   receiver.audioContext = null;
   receiver.seenVideoSeq.clear();
   receiver.seenAudioSeq.clear();
+  receiver.audioPending.length = 0;
+  receiver.audioPendingSeconds = 0;
+  receiver.nextAudioTime = 0;
 }
+
+const MEDIA_SEQ_WINDOW = 256;
+// 记录每个 seen 集合已推进到的保留下限，修剪只发生在下限前进时且按插入序早停，摊销 O(1)。
+const seenMediaSeqLowWatermark = new WeakMap<Set<number>, number>();
 
 function trimSeenMediaSeq(seen: Set<number>, seq: number): boolean {
   if (seen.has(seq)) {
     return false;
   }
   seen.add(seq);
-  if (seen.size > 256) {
-    const minRetained = seq - 256;
-    for (const item of [...seen]) {
-      if (item < minRetained) {
-        seen.delete(item);
+  const minRetained = seq - MEDIA_SEQ_WINDOW;
+  const lastLow = seenMediaSeqLowWatermark.get(seen) ?? Number.NEGATIVE_INFINITY;
+  if (minRetained > lastLow) {
+    for (const item of seen) {
+      if (item >= minRetained) {
+        break;
       }
+      seen.delete(item);
     }
+    seenMediaSeqLowWatermark.set(seen, minRetained);
   }
   return true;
 }
@@ -3874,9 +4121,12 @@ function decodeCallVideo(
     return;
   }
   if (!receiver.gotVideoKeyFrame && payload.chunkType !== "key") {
+    // 等待关键帧期间丢弃的 P 帧计入拥塞统计。
+    noteVideoFrameDrop(participant);
     return;
   }
   if (receiver.videoDecoder.decodeQueueSize > 8) {
+    noteVideoFrameDrop(participant);
     return;
   }
   const hadVideoKeyFrame = receiver.gotVideoKeyFrame;
@@ -3992,19 +4242,19 @@ function playDecodedAudio(participant: CallParticipant, audioData: AudioDataLike
   let sum = 0;
   let samples = 0;
   for (let channel = 0; channel < channels; channel += 1) {
-    const target = new Float32Array(audioData.numberOfFrames);
+    const target = getAudioLevelBuffer(audioData.numberOfFrames, 1);
     try {
       audioData.copyTo(target, { planeIndex: channel, format: "f32-planar" });
     } catch {
       audioData.copyTo(target, { planeIndex: channel });
     }
     const step = Math.max(1, Math.floor(target.length / 1024));
-    for (let index = 0; index < target.length; index += step) {
+    for (let index = 0; index < audioData.numberOfFrames; index += step) {
       const value = target[index] ?? 0;
       sum += value * value;
       samples += 1;
     }
-    buffer.copyToChannel(target, channel);
+    buffer.copyToChannel(target as Float32Array<ArrayBuffer>, channel);
   }
   const currentCall = runtime?.call;
   if (currentCall?.participants.get(participant.peerId) === participant) {
@@ -4014,23 +4264,45 @@ function playDecodedAudio(participant: CallParticipant, audioData: AudioDataLike
       samples > 0 ? Math.sqrt(sum / samples) : 0
     );
   }
-  const source = context.createBufferSource();
-  source.buffer = buffer;
-  source.connect(context.destination);
-  source.addEventListener(
-    "ended",
-    () => {
-      source.disconnect();
-    },
-    { once: true }
-  );
-  if (receiver.nextAudioTime - context.currentTime > CALL_MAX_AUDIO_QUEUE_DELAY_SEC) {
-    receiver.nextAudioTime = context.currentTime + 0.05;
-  }
-  const startAt = Math.max(context.currentTime + 0.02, receiver.nextAudioTime || 0);
-  source.start(startAt);
-  receiver.nextAudioTime = startAt + buffer.duration;
+  // 音频 jitter buffer：解码帧先蓄水到 pending 队列；播放链健康（nextAudioTime 领先）时
+  // 逐帧泵入保持连续，欠载（underrun）后攒到阈值再起播，消除网络抖动导致的断续。
   audioData.close();
+  const now = context.currentTime;
+  if (receiver.nextAudioTime - now > CALL_MAX_AUDIO_QUEUE_DELAY_SEC) {
+    receiver.nextAudioTime = now + 0.05;
+  }
+  const seconds = buffer.duration;
+  receiver.audioPending.push({ buffer, seconds });
+  receiver.audioPendingSeconds += seconds;
+  while (receiver.audioPendingSeconds > CALL_AUDIO_JITTER_MAX_SECONDS && receiver.audioPending.length > 1) {
+    const dropped = receiver.audioPending.shift()!;
+    receiver.audioPendingSeconds -= dropped.seconds;
+  }
+  const chainAhead = receiver.nextAudioTime > now;
+  if (!chainAhead && receiver.audioPendingSeconds < CALL_AUDIO_JITTER_FILL_SECONDS) {
+    // 欠载或冷启动：蓄水到 100ms 再起播，避免逐帧拼接产生间隙。
+    return;
+  }
+  if (!chainAhead) {
+    receiver.nextAudioTime = now + 0.03;
+  }
+  for (const item of receiver.audioPending) {
+    const source = context.createBufferSource();
+    source.buffer = item.buffer;
+    source.connect(context.destination);
+    source.addEventListener(
+      "ended",
+      () => {
+        source.disconnect();
+      },
+      { once: true }
+    );
+    const startAt = Math.max(receiver.nextAudioTime, now + 0.005);
+    source.start(startAt);
+    receiver.nextAudioTime = startAt + item.seconds;
+  }
+  receiver.audioPending.length = 0;
+  receiver.audioPendingSeconds = 0;
 }
 
 async function sendTextMessage(text: string): Promise<boolean> {
@@ -4161,19 +4433,12 @@ async function sendAttachmentFile(file: File): Promise<void> {
   }
   pushMessage(state, ownMessage);
   renderChat({ forceScrollToBottom: true });
+  // 进度条直接改写对应气泡 DOM（O(1)），整条消息列表不再随分片重建。
   const updateProgress = (ratio: number): void => {
     ownMessage.fileProgress = ratio;
-    renderChat({ forceScrollToBottom: true });
+    updateFileProgressRow(ownMessage, ratio);
   };
-  let lastRenderAt = 0;
-  const updateProgressThrottled = (ratio: number): void => {
-    ownMessage.fileProgress = ratio;
-    const now = Date.now();
-    if (now - lastRenderAt > 300) {
-      lastRenderAt = now;
-      renderChat();
-    }
-  };
+  const updateProgressThrottled = updateProgress;
   try {
     if (
       delivery.targets.length > 0 &&
@@ -4194,8 +4459,6 @@ async function sendAttachmentFile(file: File): Promise<void> {
     ) {
       throw new Error("send_failed");
     }
-    const chunkDelayMs =
-      delivery.targets.length > 0 ? Math.max(90, delivery.targets.length * 125) : 0;
     for (let index = 0; index < chunks; index += 1) {
       const start = index * FILE_CHUNK_BYTES;
       const chunk = bytes.subarray(start, Math.min(start + FILE_CHUNK_BYTES, bytes.length));
@@ -4224,8 +4487,8 @@ async function sendAttachmentFile(file: File): Promise<void> {
           updateProgressThrottled(ratio);
         }
       }
-      if (chunkDelayMs > 0 && index < chunks - 1) {
-        await delay(chunkDelayMs);
+      if (index < chunks - 1) {
+        await waitFileBackpressure(state);
       }
     }
     if (
@@ -4245,11 +4508,13 @@ async function sendAttachmentFile(file: File): Promise<void> {
     }
   } catch (error) {
     ownMessage.fileProgress = -1;
+    ownMessage.renderDirty = true;
     renderChat();
     throw error;
   }
-  ownMessage.fileProgress = undefined;
+  delete ownMessage.fileProgress;
   ownMessage.fileBlob = file;
+  ownMessage.renderDirty = true;
   renderChat({ forceScrollToBottom: true });
 }
 
@@ -4457,11 +4722,51 @@ function renderModeBanner(privatePeer: PeerRuntime | null): HTMLElement {
 }
 
 function renderMessageList(state: Runtime): HTMLElement {
-  const messages = el("div", { className: "messages" });
-  for (const message of state.messages) {
-    messages.append(renderMessageRow(message));
+  if (messagesContainer && messagesContainerState === state) {
+    reconcileMessageList(state, messagesContainer);
+    return messagesContainer;
   }
-  return messages;
+  messagesContainer = el("div", { className: "messages" });
+  messagesContainerState = state;
+  for (const message of state.messages) {
+    messagesContainer.append(renderMessageRow(message));
+  }
+  return messagesContainer;
+}
+
+function reconcileMessageList(state: Runtime, container: HTMLElement): void {
+  // 行按消息 id 与 state.messages 对账：已删/被头部修剪的行移除，
+  // 脏位行原位重建，新增消息只追加尾部。
+  const current = new Map<string, ChatMessage>();
+  for (const message of state.messages) {
+    current.set(message.id, message);
+  }
+  const seen = new Set<string>();
+  for (const child of [...container.children]) {
+    if (!(child instanceof HTMLElement)) {
+      continue;
+    }
+    const id = messageRowIds.get(child);
+    if (id === undefined) {
+      child.remove();
+      continue;
+    }
+    seen.add(id);
+    const message = current.get(id);
+    if (!message) {
+      child.remove();
+      continue;
+    }
+    if (message.renderDirty) {
+      message.renderDirty = false;
+      container.replaceChild(renderMessageRow(message), child);
+    }
+  }
+  for (const message of state.messages) {
+    if (!seen.has(message.id)) {
+      container.append(renderMessageRow(message));
+    }
+  }
 }
 
 function renderMessageRow(message: ChatMessage): HTMLElement {
@@ -4485,7 +4790,37 @@ function renderMessageRow(message: ChatMessage): HTMLElement {
   } else {
     row.append(el("div", { className: "message-text", text: message.text ?? "" }));
   }
+  messageRowIds.set(row, message.id);
+  messageRows.set(message, row);
   return row;
+}
+
+function findFileProgressElements(
+  row: HTMLElement
+): { fill: HTMLElement; label: HTMLElement } | null {
+  const fill = row.querySelector<HTMLElement>(".file-progress-fill");
+  const label = row.querySelector<HTMLElement>(".file-progress-label");
+  return fill && label ? { fill, label } : null;
+}
+
+/**
+ * 传输进度直接改写对应气泡的进度条与百分比文本（O(1) DOM 操作），
+ * 不再让每个分片触发整条消息列表重建；进度条结构随行的创建/替换而重建。
+ */
+function updateFileProgressRow(message: ChatMessage, ratio: number): void {
+  const row = messageRows.get(message);
+  if (!row || !row.isConnected) {
+    message.renderDirty = true;
+    return;
+  }
+  const found = findFileProgressElements(row);
+  if (!found) {
+    message.renderDirty = true;
+    return;
+  }
+  const percent = Math.round(ratio * 100);
+  found.fill.style.width = `${percent}%`;
+  found.label.textContent = `传输中 ${percent}%`;
 }
 
 function renderImageMessage(message: ChatMessage): HTMLImageElement {
@@ -4970,6 +5305,7 @@ function renderChat(options: RenderChatOptions = {}): void {
   }
   const composerSnapshot = captureComposerSnapshot(state);
   const previousMessages = appRoot.querySelector<HTMLElement>(".messages");
+  const savedScrollTop = previousMessages?.scrollTop ?? 0;
   const shouldStickToBottom =
     options.forceScrollToBottom ||
     !previousMessages ||
@@ -5021,8 +5357,11 @@ function renderChat(options: RenderChatOptions = {}): void {
     layout.append(callLayer);
   }
   setApp(layout);
+  // 持久消息容器复用后滚动位置会被 DOM 搬移重置：贴底时强制滚底，否则恢复原位置。
   if (shouldStickToBottom) {
     messages.scrollTop = messages.scrollHeight;
+  } else if (previousMessages) {
+    messages.scrollTop = savedScrollTop;
   }
   restoreComposerSnapshot(composerSnapshot);
 }

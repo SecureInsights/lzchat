@@ -90,6 +90,15 @@ export type PlainPayload =
   | { type: "call-answer"; callId: string; mode: "encoded-media"; createdAt: number }
   | { type: "call-end"; callId: string; reason?: string; createdAt: number }
   | {
+      type: "call-quality";
+      callId: string;
+      /** 2s 窗口内每秒丢帧数（接收端解码统计）。 */
+      droppedFps?: number;
+      /** 回报时刻解码器排队深度。 */
+      decodeQueue?: number;
+      createdAt: number
+    }
+  | {
       type: "call-media";
       callId: string;
       media: "audio" | "video";

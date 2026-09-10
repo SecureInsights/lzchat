@@ -356,6 +356,26 @@ export function validatePlainPayload(value: unknown, depth = 0): PlainPayload | 
         return null;
       }
       return isTimestamp(value.createdAt) ? (value as PlainPayload) : null;
+    case "call-quality":
+      if (!isValidSmallToken(value.callId)) {
+        return null;
+      }
+      if (
+        value.droppedFps !== undefined &&
+        (typeof value.droppedFps !== "number" || value.droppedFps < 0 || value.droppedFps > 120)
+      ) {
+        return null;
+      }
+      if (
+        value.decodeQueue !== undefined &&
+        (typeof value.decodeQueue !== "number" ||
+          !Number.isSafeInteger(value.decodeQueue) ||
+          value.decodeQueue < 0 ||
+          value.decodeQueue > 256)
+      ) {
+        return null;
+      }
+      return isTimestamp(value.createdAt) ? (value as PlainPayload) : null;
     case "call-media":
       if (
         !isValidSmallToken(value.callId) ||
