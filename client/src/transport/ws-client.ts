@@ -8,18 +8,36 @@ export type WsClientHandlers = {
   status: (status: string) => void;
 };
 
+const PONG_WATCHDOG_MS = 10_000;
+const MAX_OUTBOX = 64;
+
 export class WsClient {
   #socket: WebSocket | null = null;
   #closed = false;
   #attempt = 0;
   #reconnectTimer: number | null = null;
   #heartbeatTimer: number | null = null;
+  #pongTimer: number | null = null;
+  #outbox: unknown[] = [];
+  #onVisibility: () => void;
+  #onOnline: () => void;
 
   constructor(
     private readonly url: string,
     private readonly joinMessage: JoinMessage,
     private readonly handlers: WsClientHandlers
-  ) {}
+  ) {
+    // 移动端切后台时定时器被冻结、连接可能被系统杀掉，close 事件也可能延迟；
+    // 回到前台或网络恢复时立即探活，不等心跳/退避定时器。
+    this.#onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        this.probe();
+      }
+    };
+    this.#onOnline = () => this.probe();
+    document.addEventListener("visibilitychange", this.#onVisibility);
+    window.addEventListener("online", this.#onOnline);
+  }
 
   connect(): void {
     if (this.#reconnectTimer !== null) {
@@ -31,16 +49,23 @@ export class WsClient {
     const socket = new WebSocket(this.url);
     this.#socket = socket;
     socket.addEventListener("open", () => {
+      // 陈旧连接（已被新连接替换）不得再发送 join 或触发本端会话重置。
+      if (this.#isStale(socket)) {
+        socket.close();
+        return;
+      }
       this.#attempt = 0;
       this.handlers.status("已连接");
       this.send(this.joinMessage);
       this.startHeartbeat();
+      this.flushOutbox();
       this.handlers.open();
     });
     socket.addEventListener("message", (event) => {
-      if (typeof event.data !== "string") {
+      if (this.#isStale(socket) || typeof event.data !== "string") {
         return;
       }
+      this.clearPongWatchdog();
       const parsed = validateServerMessage(parseJsonObject(event.data), this.joinMessage.roomId);
       if (!parsed) {
         return;
@@ -54,10 +79,15 @@ export class WsClient {
       }
     });
     socket.addEventListener("close", () => {
+      // 陈旧连接（已被新连接替换）的事件不得影响当前连接的心跳与重连调度。
+      if (this.#socket !== null && this.#socket !== socket) {
+        return;
+      }
       if (this.#socket === socket) {
         this.#socket = null;
       }
       this.stopHeartbeat();
+      this.clearPongWatchdog();
       this.handlers.close();
       if (!this.#closed) {
         this.handlers.status("已断开，正在重连");
@@ -72,14 +102,50 @@ export class WsClient {
       }
     });
     socket.addEventListener("error", () => {
+      if (this.#socket !== null && this.#socket !== socket) {
+        return;
+      }
       this.handlers.status("连接错误");
     });
   }
 
+  /**
+   * 移动端回到前台 / 网络恢复时的即时探活：
+   * - 无连接且无重连计划 → 立即重连（不等可能被冻结过的退避定时器）；
+   * - 连接仍在 OPEN → 发一次应用层 ping，由 pong 看门狗判定链路死活；
+   * - 正在连接中 → 不动。
+   */
+  probe(): void {
+    if (this.#closed) {
+      return;
+    }
+    const socket = this.#socket;
+    if (!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING) {
+      if (this.#reconnectTimer === null) {
+        this.connect();
+      }
+      return;
+    }
+    if (socket.readyState === WebSocket.OPEN) {
+      const ping: PingMessage = {
+        v: 3,
+        t: "ping",
+        roomId: this.joinMessage.roomId,
+        clientId: this.joinMessage.clientId
+      };
+      if (this.send(ping)) {
+        this.armPongWatchdog();
+      }
+    }
+  }
+
   send(value: unknown): boolean {
     const socket = this.#socket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (this.#closed) {
       return false;
+    }
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return this.enqueueOutbox(value);
     }
     socket.send(JSON.stringify(value));
     return true;
@@ -95,13 +161,41 @@ export class WsClient {
 
   close(): void {
     this.#closed = true;
+    document.removeEventListener("visibilitychange", this.#onVisibility);
+    window.removeEventListener("online", this.#onOnline);
     this.stopHeartbeat();
+    this.clearPongWatchdog();
+    this.#outbox = [];
     if (this.#reconnectTimer !== null) {
       window.clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = null;
     }
     this.#socket?.close(1000, "client closing");
     this.#socket = null;
+  }
+
+  #isStale(socket: WebSocket): boolean {
+    return this.#socket !== null && this.#socket !== socket;
+  }
+
+  private enqueueOutbox(value: unknown): boolean {
+    if (this.#outbox.length >= MAX_OUTBOX) {
+      return false;
+    }
+    this.#outbox.push(value);
+    return true;
+  }
+
+  private flushOutbox(): void {
+    const socket = this.#socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const queued = this.#outbox;
+    this.#outbox = [];
+    for (const value of queued) {
+      socket.send(JSON.stringify(value));
+    }
   }
 
   private startHeartbeat(): void {
@@ -113,7 +207,9 @@ export class WsClient {
         roomId: this.joinMessage.roomId,
         clientId: this.joinMessage.clientId
       };
-      this.send(ping);
+      if (this.send(ping)) {
+        this.armPongWatchdog();
+      }
     }, 25_000);
   }
 
@@ -121,6 +217,25 @@ export class WsClient {
     if (this.#heartbeatTimer !== null) {
       window.clearInterval(this.#heartbeatTimer);
       this.#heartbeatTimer = null;
+    }
+  }
+
+  private armPongWatchdog(): void {
+    this.clearPongWatchdog();
+    this.#pongTimer = window.setTimeout(() => {
+      this.#pongTimer = null;
+      const socket = this.#socket;
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        // 半开链路：ping 发出后 PONG_WATCHDOG_MS 内无任何入站帧，主动断开触发重连。
+        socket.close(4000, "pong_timeout");
+      }
+    }, PONG_WATCHDOG_MS);
+  }
+
+  private clearPongWatchdog(): void {
+    if (this.#pongTimer !== null) {
+      window.clearTimeout(this.#pongTimer);
+      this.#pongTimer = null;
     }
   }
 }

@@ -111,6 +111,9 @@ export function validateJoinMessage(value: unknown, expectedRoomId?: string): Jo
   if (value.identityPub !== undefined && !isValidPublicKey(value.identityPub)) {
     return null;
   }
+  if (!isValidSmallToken(value.connectionEpoch)) {
+    return null;
+  }
   if (!validateCapabilities(value.capabilities)) {
     return null;
   }
@@ -138,6 +141,9 @@ export function validateMembersMessage(value: unknown, expectedRoomId?: string):
       return null;
     }
     if (member.identityPub !== undefined && !isValidPublicKey(member.identityPub)) {
+      return null;
+    }
+    if (!isValidSmallToken(member.connectionEpoch)) {
       return null;
     }
     if (!validateCapabilities(member.capabilities)) {
@@ -393,6 +399,9 @@ export function validateServerMessage(value: unknown, expectedRoomId?: string): 
   const relay = validateRelayEnvelope(value, expectedRoomId);
   if (relay) {
     return relay;
+  }
+  if (isObject(value) && value.v === 3 && value.t === "pong" && isValidRoomId(value.roomId) && (!expectedRoomId || value.roomId === expectedRoomId)) {
+    return value as ServerMessage;
   }
   if (isObject(value) && value.v === 3 && value.t === "error" && typeof value.code === "string") {
     return value as ServerMessage;

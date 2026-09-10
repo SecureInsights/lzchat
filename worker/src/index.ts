@@ -13,6 +13,7 @@ import {
   parseJsonObject,
   validateJoinMessage,
   validatePingMessage,
+  pongMessage,
   validateRelayEnvelope,
   type CapabilitySet,
   type JoinMessage
@@ -33,6 +34,7 @@ type ClientState = {
   clientId: string;
   sessionPub: string;
   identityPub?: string;
+  connectionEpoch: string;
   capabilities: CapabilitySet;
   seenAt: number;
   joinedAt: number;
@@ -104,7 +106,8 @@ export class ChatRoom {
       return;
     }
     state.seenAt = Date.now();
-    if (validatePingMessage(parsed, this.#roomId, state.clientId)) {
+    if (validatePingMessage(parsed, this.#roomId)) {
+      this.safeSend(socket, pongMessage(this.#roomId));
       return;
     }
     const relay = validateRelayEnvelope(parsed, this.#roomId, state.clientId, (clientId) => this.#clients.has(clientId));
@@ -143,6 +146,7 @@ export class ChatRoom {
       socket,
       clientId: join.clientId,
       sessionPub: join.sessionPub,
+      connectionEpoch: join.connectionEpoch,
       capabilities: join.capabilities,
       seenAt: Date.now(),
       joinedAt: Date.now(),
@@ -214,10 +218,12 @@ export class ChatRoom {
         clientId: string;
         sessionPub: string;
         identityPub?: string;
+        connectionEpoch: string;
         capabilities: CapabilitySet;
       } = {
         clientId: client.clientId,
         sessionPub: client.sessionPub,
+        connectionEpoch: client.connectionEpoch,
         capabilities: client.capabilities
       };
       if (client.identityPub) {

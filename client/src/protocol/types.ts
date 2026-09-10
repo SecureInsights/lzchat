@@ -14,6 +14,7 @@ export type JoinMessage = {
   clientId: string;
   sessionPub: string;
   identityPub?: string;
+  connectionEpoch: string;
   capabilities: CapabilitySet;
 };
 
@@ -22,6 +23,12 @@ export type PingMessage = {
   t: "ping";
   roomId: string;
   clientId: string;
+};
+
+export type PongMessage = {
+  v: 3;
+  t: "pong";
+  roomId: string;
 };
 
 export type MembersMessage = {
@@ -33,6 +40,7 @@ export type MembersMessage = {
     clientId: string;
     sessionPub: string;
     identityPub?: string;
+    connectionEpoch: string;
     capabilities: CapabilitySet;
   }>;
 };
@@ -61,7 +69,7 @@ export type RelayEnvelope = {
   ct: string;
 };
 
-export type ServerMessage = MembersMessage | RelayEnvelope | { v: 3; t: "error"; code: string };
+export type ServerMessage = MembersMessage | RelayEnvelope | PongMessage | { v: 3; t: "error"; code: string };
 
 export type PlainPayload =
   | { type: "profile"; displayName: string; roomName?: string; avatarSeed?: string; createdAt: number }

@@ -17,6 +17,7 @@ import {
   parseJsonObject,
   validateJoinMessage,
   validatePingMessage,
+  pongMessage,
   validateRelayEnvelope,
   type CapabilitySet,
   type JoinMessage
@@ -27,6 +28,7 @@ type ClientState = {
   clientId: string;
   sessionPub: string;
   identityPub?: string;
+  connectionEpoch: string;
   capabilities: CapabilitySet;
   seenAt: number;
   joinedAt: number;
@@ -39,10 +41,11 @@ type ClientState = {
 const MAX_SOCKET_BUFFER_BYTES = 2 * 1024 * 1024;
 
 export class WebSocketPeer {
-  #buffer = Buffer.alloc(0);
+  #buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   #closed = false;
   onText: ((text: string) => void) | null = null;
   onClose: (() => void) | null = null;
+  onActivity: (() => void) | null = null;
 
   constructor(private readonly socket: Duplex) {
     socket.on("data", (chunk: Buffer) => this.accept(chunk));
@@ -52,6 +55,14 @@ export class WebSocketPeer {
 
   sendText(text: string): void {
     this.sendFrame(0x1, Buffer.from(text, "utf8"));
+  }
+
+  ping(): void {
+    this.sendFrame(0x9, Buffer.alloc(0));
+  }
+
+  terminate(): void {
+    this.terminateLocal();
   }
 
   close(code = 1000, reason = ""): void {
@@ -71,7 +82,8 @@ export class WebSocketPeer {
     if (this.#closed) {
       return;
     }
-    this.#buffer = Buffer.concat([this.#buffer, chunk]);
+    // 空闲残留为空时直接复用 chunk，避免逐事件 concat 造成 O(n²) 拷贝。
+    this.#buffer = this.#buffer.length === 0 ? chunk : Buffer.concat([this.#buffer, chunk]);
     if (this.#buffer.length > MAX_RELAY_SIZE + 14) {
       this.close(1009, "too_big");
       return;
@@ -124,12 +136,20 @@ export class WebSocketPeer {
       }
       this.#buffer = this.#buffer.subarray(offset + payloadLength);
       if (opcode === 0x8) {
+        // 回送 close 帧完成关闭握手，再结束连接。
+        this.sendFrame(0x8, payload.subarray(0, Math.min(2, payload.length)));
         this.closeLocal();
         this.socket.end();
         return;
       }
       if (opcode === 0x9) {
         this.sendFrame(0x0a, payload);
+        this.onActivity?.();
+        continue;
+      }
+      if (opcode === 0xa) {
+        // 浏览器对服务器 ping 的自动 pong：仅证明链路存活。
+        this.onActivity?.();
         continue;
       }
       if (opcode !== 0x1) {
@@ -141,7 +161,12 @@ export class WebSocketPeer {
   }
 
   private sendFrame(opcode: number, payload: Buffer): void {
-    if (this.#closed || !this.socket.writable) {
+    if (this.#closed) {
+      return;
+    }
+    if (!this.socket.writable) {
+      // 写入端已失效（对端进程消失/TCP 死亡），立即终止以触发成员剔除。
+      this.terminateLocal();
       return;
     }
     if (this.socket.writableLength > MAX_SOCKET_BUFFER_BYTES) {
@@ -196,14 +221,13 @@ class Room {
     private readonly onEmpty: (roomId: string) => void
   ) {}
 
+  canAcceptSocket(): boolean {
+    return this.#sockets < MAX_PENDING_SOCKETS_PER_ROOM + MAX_ROOM_MEMBERS;
+  }
+
   attach(socket: WebSocketPeer): void {
     let state: ClientState | null = null;
     this.#sockets += 1;
-    if (this.#sockets > MAX_PENDING_SOCKETS_PER_ROOM + MAX_ROOM_MEMBERS) {
-      this.#sockets -= 1;
-      socket.close(1013, "too_many_sockets");
-      return;
-    }
     const joinDeadline = setTimeout(() => {
       if (!state) {
         socket.close(1008, "join_timeout");
@@ -213,10 +237,19 @@ class Room {
       if (!state) {
         return;
       }
+      // 先探测：浏览器会自动回 pong（onActivity 刷新 seenAt）；
+      // 链路死亡时 ping 无法得到回应，超过 CLIENT_TIMEOUT_MS 即剔除幽灵成员。
       if (Date.now() - state.seenAt > CLIENT_TIMEOUT_MS) {
-        socket.close(1001, "timeout");
+        socket.terminate();
+        return;
       }
+      socket.ping();
     }, 30_000);
+    socket.onActivity = () => {
+      if (state) {
+        state.seenAt = Date.now();
+      }
+    };
     socket.onText = (text) => {
       if (Buffer.byteLength(text, "utf8") > MAX_RELAY_SIZE) {
         socket.close(1009, "too_big");
@@ -266,6 +299,7 @@ class Room {
       socket,
       clientId: join.clientId,
       sessionPub: join.sessionPub,
+      connectionEpoch: join.connectionEpoch,
       capabilities: join.capabilities,
       seenAt: Date.now(),
       joinedAt: Date.now(),
@@ -284,7 +318,8 @@ class Room {
 
   private onClientMessage(state: ClientState, parsed: Record<string, unknown> | null): void {
     state.seenAt = Date.now();
-    if (validatePingMessage(parsed, this.roomId, state.clientId)) {
+    if (validatePingMessage(parsed, this.roomId)) {
+      state.socket.sendText(pongMessage(this.roomId));
       return;
     }
     const relay = validateRelayEnvelope(parsed, this.roomId, state.clientId, (clientId) => this.clients.has(clientId));
@@ -347,10 +382,12 @@ class Room {
         clientId: string;
         sessionPub: string;
         identityPub?: string;
+        connectionEpoch: string;
         capabilities: CapabilitySet;
       } = {
         clientId: client.clientId,
         sessionPub: client.sessionPub,
+        connectionEpoch: client.connectionEpoch,
         capabilities: client.capabilities
       };
       if (client.identityPub) {
@@ -429,6 +466,12 @@ export class RelayHub {
       }
       room = new Room(roomId, (emptyRoomId) => this.#rooms.delete(emptyRoomId));
       this.#rooms.set(roomId, room);
+    }
+    // 在 101 握手前拒绝超容连接，避免客户端先看到“连接成功”再被踢。
+    if (!room.canAcceptSocket()) {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
     }
     room.attach(peer);
   }

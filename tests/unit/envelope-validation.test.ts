@@ -25,6 +25,7 @@ describe("envelope validator", () => {
           roomId,
           clientId: clientA,
           sessionPub,
+          connectionEpoch: "epoch-1",
           capabilities: { ratchet: "v1", aead: "aes-gcm", file: true, maxRelayBytes: 1024 }
         },
         roomId

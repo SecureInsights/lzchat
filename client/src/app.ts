@@ -48,6 +48,7 @@ import { WsClient } from "./transport/ws-client";
 type PeerRuntime = {
   clientId: string;
   sessionPub: string;
+  connectionEpoch: string;
   displayName: string;
   capabilities: CapabilitySet;
   pair: PairSession;
@@ -966,6 +967,24 @@ function destroyRuntime(): void {
   runtime = null;
 }
 
+/**
+ * 本端重连成功后调用：连接实例已更换，旧配对会话的棘轮链位置对对端不可达，
+ * 全部作废并等待 members 广播后按新 connectionEpoch 重建。
+ */
+function resetPeersForReconnect(state: Runtime): void {
+  const activeCall = state.call;
+  state.call = null;
+  if (activeCall) {
+    cleanupCall(activeCall);
+  }
+  for (const peer of state.peers.values()) {
+    destroyPeer(peer);
+  }
+  state.peers.clear();
+  state.pendingRelays.clear();
+  state.invalidPeerNotices.clear();
+}
+
 function queuePendingRelay(state: Runtime, envelope: RelayEnvelope): void {
   const queued = state.pendingRelays.get(envelope.from) ?? [];
   queued.push(envelope);
@@ -1380,13 +1399,19 @@ async function startRoom(input: {
     roomId: room.roomId,
     clientId,
     sessionPub: session.publicKeyToken,
+    connectionEpoch: base64urlEncode(randomBytes(8)),
     capabilities
   };
   const ws = new WsClient(wsUrlForRoom(room.roomId), joinMessage, {
     open: () => {
-      void sendProfilesToAll();
+      // 本端连接实例已更换（重连）：旧配对会话的棘轮位置作废，等待 members 广播后重建。
+      if (runtime) {
+        resetPeersForReconnect(runtime);
+      }
     },
     close: () => {
+      // 每次断开后更换连接实例标识，让对端能区分“同一连接的重复广播”和“新连接重进”。
+      joinMessage.connectionEpoch = base64urlEncode(randomBytes(8));
       if (runtime) {
         runtime.status = "已断开";
         renderChat();
@@ -1490,7 +1515,9 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       continue;
     }
     const existing = state.peers.get(member.clientId);
-    if (existing && existing.sessionPub === member.sessionPub) {
+    // 同一 sessionPub 但连接实例（connectionEpoch）变化：对端重连过，旧棘轮位置已作废，必须重建。
+    const epochChanged = Boolean(existing) && existing!.connectionEpoch !== member.connectionEpoch;
+    if (existing && !epochChanged && existing.sessionPub === member.sessionPub) {
       continue;
     }
     const isNewPeer = !existing;
@@ -1499,7 +1526,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     const previousMessageWindow = existing?.messageWindow ?? [];
     const previousMediaMessageWindow = existing?.mediaMessageWindow ?? [];
     const previousMediaByteWindow = existing?.mediaByteWindow ?? [];
-    const previousSeenControlSeq = existing?.seenControlSeq ?? new Set<number>();
+    const previousSeenControlSeq = epochChanged ? new Set<number>() : existing?.seenControlSeq ?? new Set<number>();
     const previousLastIncomingCallOfferAt = existing?.lastIncomingCallOfferAt ?? 0;
     let pair: PairSession;
     try {
@@ -1530,6 +1557,8 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       if (removed.removedFromCall) {
         addSystemMessage("通话已重置。");
       }
+    } else if (epochChanged) {
+      addSystemMessage(`${previousDisplayName ?? "成员"} 已重新连接。`);
     }
     const sendRatchet = new SendRatchet(pair.sendCK);
     const recvRatchet = new ReceiveRatchet(pair.recvCK);
@@ -1546,6 +1575,7 @@ async function handleMembers(message: MembersMessage): Promise<void> {
     const peerState: PeerRuntime = {
       clientId: member.clientId,
       sessionPub: member.sessionPub,
+      connectionEpoch: member.connectionEpoch,
       displayName: previousDisplayName ?? `临时成员 ${member.clientId.slice(0, 4)}`,
       capabilities: member.capabilities,
       pair,

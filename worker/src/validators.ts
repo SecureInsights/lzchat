@@ -12,6 +12,7 @@ export type JoinMessage = {
   clientId: string;
   sessionPub: string;
   identityPub?: string;
+  connectionEpoch: string;
   capabilities: CapabilitySet;
 };
 
@@ -108,6 +109,9 @@ export function validateJoinMessage(value: unknown, expectedRoomId: string): Joi
   if (value.identityPub !== undefined && (typeof value.identityPub !== "string" || !PUBLIC_KEY_RE.test(value.identityPub))) {
     return null;
   }
+  if (typeof value.connectionEpoch !== "string" || !SMALL_TOKEN_RE.test(value.connectionEpoch)) {
+    return null;
+  }
   if (!isObject(value.capabilities)) {
     return null;
   }
@@ -129,8 +133,7 @@ export function validateJoinMessage(value: unknown, expectedRoomId: string): Joi
 
 export function validatePingMessage(
   value: unknown,
-  expectedRoomId: string,
-  expectedClientId: string
+  expectedRoomId: string
 ): PingMessage | null {
   if (!isObject(value) || value.v !== 3 || value.t !== "ping") {
     return null;
@@ -138,10 +141,14 @@ export function validatePingMessage(
   if (typeof value.roomId !== "string" || value.roomId !== expectedRoomId || !ROOM_ID_RE.test(value.roomId)) {
     return null;
   }
-  if (typeof value.clientId !== "string" || value.clientId !== expectedClientId || !CLIENT_ID_RE.test(value.clientId)) {
+  if (typeof value.clientId !== "string" || !CLIENT_ID_RE.test(value.clientId)) {
     return null;
   }
   return value as PingMessage;
+}
+
+export function pongMessage(roomId: string): string {
+  return JSON.stringify({ v: 3, t: "pong", roomId });
 }
 
 export function validateRelayEnvelope(
