@@ -568,6 +568,39 @@ textarea:disabled {
   font-size: 12px;
 }
 
+.file-progress {
+  grid-column: 1 / -1;
+  height: 4px;
+  border-radius: 2px;
+  background: #e3ebf2;
+  overflow: hidden;
+}
+
+.file-progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: #1d8fd1;
+  transition: width 0.2s ease;
+}
+
+.file-progress-label {
+  color: #1d8fd1;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.file-progress-label.failed {
+  color: #c6402f;
+}
+
+.file-message.transferring .file-icon {
+  opacity: 0.55;
+}
+
+.file-message.failed .file-icon {
+  opacity: 0.55;
+}
+
 .file-download {
   min-height: 32px;
   border-radius: 999px;

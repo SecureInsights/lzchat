@@ -86,6 +86,8 @@ type ChatMessage = {
   fileName?: string;
   fileSize?: number;
   fileBlob?: Blob;
+  /** 0-1 为传输中进度；<0 表示发送失败；缺省表示已完成。 */
+  fileProgress?: number;
   peerName?: string;
 };
 
@@ -449,9 +451,12 @@ const CALL_SPEAKING_LEVEL = 0.035;
 const CALL_SPEAKING_HOLD_MS = 620;
 const MAX_INLINE_IMAGE_BYTES = 3 * 1024 * 1024;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
+const FILE_PROGRESS_RENDER_INTERVAL_MS = 300;
 const MAX_FILE_BATCH = 10;
 const MAX_FILE_BATCH_BYTES = 100 * 1024 * 1024;
 const FILE_CHUNK_BYTES = 256 * 1024;
+// 接收进度渲染节流：分片到达很密，不必每片都重建消息列表。
+let incomingProgressLastRenderAt = 0;
 const FILE_RECEIVE_TIMEOUT_MS = 2 * 60 * 1000;
 const MAX_INCOMING_FILES_PER_PEER = 3;
 const MAX_INCOMING_FILES_TOTAL = 12;
@@ -1118,6 +1123,15 @@ function deleteIncomingFile(state: Runtime, key: string): void {
   if (file) {
     zeroizeIncomingFile(file);
     state.incomingFiles.delete(key);
+    // 接收中断（超时/对端离开/校验失败）时把占位气泡标记为传输失败。
+    const placeholder = state.messages.find(
+      (message) =>
+        message.id === `${file.from}:file:${file.fileId}` && message.fileProgress !== undefined
+    );
+    if (placeholder) {
+      placeholder.fileProgress = -1;
+      renderChat();
+    }
   }
 }
 
@@ -1878,6 +1892,26 @@ function handleFileMeta(
     incoming.peerName = peer.displayName;
   }
   state.incomingFiles.set(key, incoming);
+  // 占位气泡：与 file-done 阶段的消息 id 一致，接收完成后原地转换为可下载附件。
+  const placeholder: ChatMessage = {
+    id: `${peer.clientId}:file:${payload.fileId}`,
+    own: false,
+    author: incoming.author,
+    kind: "file",
+    text: incoming.name,
+    fileName: incoming.name,
+    fileSize: incoming.size,
+    fileProgress: 0,
+    createdAt: incoming.createdAt,
+    scope
+  };
+  if (incoming.peerName) {
+    placeholder.peerName = incoming.peerName;
+  }
+  if (!state.messages.some((message) => message.id === placeholder.id)) {
+    pushMessage(state, placeholder);
+    renderChat();
+  }
 }
 
 function handleFileChunk(
@@ -1908,6 +1942,17 @@ function handleFileChunk(
   incoming.parts[payload.index] = bytes;
   incoming.received += 1;
   incoming.receivedBytes += bytes.length;
+  const placeholder = state.messages.find(
+    (message) => message.id === `${from}:file:${payload.fileId}` && message.fileProgress !== undefined
+  );
+  if (placeholder) {
+    placeholder.fileProgress = incoming.size > 0 ? incoming.receivedBytes / incoming.size : 0;
+    const now = Date.now();
+    if (now - incomingProgressLastRenderAt > FILE_PROGRESS_RENDER_INTERVAL_MS) {
+      incomingProgressLastRenderAt = now;
+      renderChat();
+    }
+  }
 }
 
 async function handleFileDone(
@@ -1952,8 +1997,16 @@ async function handleFileDone(
   if (incoming.peerName) {
     message.peerName = incoming.peerName;
   }
+  // 占位气泡原地转换为可下载附件，保持消息 id 与位置不变。
+  const placeholderIndex = state.messages.findIndex(
+    (item) => item.id === message.id && item.fileProgress !== undefined
+  );
+  if (placeholderIndex >= 0) {
+    state.messages[placeholderIndex] = message;
+  } else {
+    pushMessage(state, message);
+  }
   deleteIncomingFile(state, key);
-  pushMessage(state, message);
   markIncomingUnread(state, message, from);
   renderChat();
   notifyIncomingMessage(state, message);
@@ -4088,66 +4141,7 @@ async function sendAttachmentFile(file: File): Promise<void> {
   const name = fileNameOrFallback(file);
   const mime = mimeOrFallback(file.type);
   const digest = await sha256(bytes);
-  if (
-    delivery.targets.length > 0 &&
-    !(await sendPayloadWithContext(
-      state,
-      delivery,
-      {
-        type: "file-meta",
-        fileId,
-        name,
-        mime,
-        size: bytes.length,
-        chunks,
-        createdAt
-      },
-      "file-meta"
-    ))
-  ) {
-    throw new Error("send_failed");
-  }
-  const chunkDelayMs =
-    delivery.targets.length > 0 ? Math.max(90, delivery.targets.length * 125) : 0;
-  for (let index = 0; index < chunks; index += 1) {
-    const start = index * FILE_CHUNK_BYTES;
-    const chunk = bytes.subarray(start, Math.min(start + FILE_CHUNK_BYTES, bytes.length));
-    if (
-      delivery.targets.length > 0 &&
-      !(await sendPayloadWithContext(
-        state,
-        delivery,
-        {
-          type: "file-chunk",
-          fileId,
-          index,
-          total: chunks,
-          bytes: base64urlEncode(chunk)
-        },
-        "file-chunk"
-      ))
-    ) {
-      throw new Error("send_failed");
-    }
-    if (chunkDelayMs > 0 && index < chunks - 1) {
-      await delay(chunkDelayMs);
-    }
-  }
-  if (
-    delivery.targets.length > 0 &&
-    !(await sendPayloadWithContext(
-      state,
-      delivery,
-      {
-        type: "file-done",
-        fileId,
-        sha256: base64urlEncode(digest)
-      },
-      "file-done"
-    ))
-  ) {
-    throw new Error("send_failed");
-  }
+  // 先用占位气泡进入消息流，随分片发送更新进度。
   const ownMessage: ChatMessage = {
     id: `own:file:${createdAt}:${Math.random()}`,
     own: true,
@@ -4156,14 +4150,106 @@ async function sendAttachmentFile(file: File): Promise<void> {
     text: name,
     fileName: name,
     fileSize: bytes.length,
-    fileBlob: file,
     createdAt,
     scope: delivery.scope
   };
   if (delivery.peerName) {
     ownMessage.peerName = delivery.peerName;
   }
+  if (delivery.targets.length > 0) {
+    ownMessage.fileProgress = 0;
+  }
   pushMessage(state, ownMessage);
+  renderChat({ forceScrollToBottom: true });
+  const updateProgress = (ratio: number): void => {
+    ownMessage.fileProgress = ratio;
+    renderChat({ forceScrollToBottom: true });
+  };
+  let lastRenderAt = 0;
+  const updateProgressThrottled = (ratio: number): void => {
+    ownMessage.fileProgress = ratio;
+    const now = Date.now();
+    if (now - lastRenderAt > 300) {
+      lastRenderAt = now;
+      renderChat();
+    }
+  };
+  try {
+    if (
+      delivery.targets.length > 0 &&
+      !(await sendPayloadWithContext(
+        state,
+        delivery,
+        {
+          type: "file-meta",
+          fileId,
+          name,
+          mime,
+          size: bytes.length,
+          chunks,
+          createdAt
+        },
+        "file-meta"
+      ))
+    ) {
+      throw new Error("send_failed");
+    }
+    const chunkDelayMs =
+      delivery.targets.length > 0 ? Math.max(90, delivery.targets.length * 125) : 0;
+    for (let index = 0; index < chunks; index += 1) {
+      const start = index * FILE_CHUNK_BYTES;
+      const chunk = bytes.subarray(start, Math.min(start + FILE_CHUNK_BYTES, bytes.length));
+      if (
+        delivery.targets.length > 0 &&
+        !(await sendPayloadWithContext(
+          state,
+          delivery,
+          {
+            type: "file-chunk",
+            fileId,
+            index,
+            total: chunks,
+            bytes: base64urlEncode(chunk)
+          },
+          "file-chunk"
+        ))
+      ) {
+        throw new Error("send_failed");
+      }
+      if (delivery.targets.length > 0) {
+        const ratio = (index + 1) / chunks;
+        if (index === chunks - 1) {
+          updateProgress(ratio);
+        } else {
+          updateProgressThrottled(ratio);
+        }
+      }
+      if (chunkDelayMs > 0 && index < chunks - 1) {
+        await delay(chunkDelayMs);
+      }
+    }
+    if (
+      delivery.targets.length > 0 &&
+      !(await sendPayloadWithContext(
+        state,
+        delivery,
+        {
+          type: "file-done",
+          fileId,
+          sha256: base64urlEncode(digest)
+        },
+        "file-done"
+      ))
+    ) {
+      throw new Error("send_failed");
+    }
+  } catch (error) {
+    ownMessage.fileProgress = -1;
+    renderChat();
+    throw error;
+  }
+  ownMessage.fileProgress = undefined;
+  ownMessage.fileBlob = file;
   renderChat({ forceScrollToBottom: true });
 }
 
@@ -4394,7 +4480,7 @@ function renderMessageRow(message: ChatMessage): HTMLElement {
   );
   if (message.kind === "image" && message.imageUrl) {
     row.append(renderImageMessage(message));
-  } else if (message.kind === "file" && message.fileBlob) {
+  } else if (message.kind === "file" && (message.fileBlob || message.fileName)) {
     row.append(renderFileMessage(message));
   } else {
     row.append(el("div", { className: "message-text", text: message.text ?? "" }));
@@ -4422,24 +4508,39 @@ function renderImageMessage(message: ChatMessage): HTMLImageElement {
 }
 
 function renderFileMessage(message: ChatMessage): HTMLElement {
-  const fileBlob = message.fileBlob!;
   const fileInfo = el("div", { className: "file-info" }, [
     el("div", { className: "file-name", text: message.fileName ?? "附件" }),
     el("div", {
       className: "file-size",
-      text: formatBytes(message.fileSize ?? fileBlob.size)
+      text: formatBytes(message.fileSize ?? message.fileBlob?.size ?? 0)
     })
   ]);
-  const download = el("button", { className: "file-download", text: "下载" });
-  download.type = "button";
-  download.addEventListener("click", () => {
-    safeDownload(fileBlob, message.fileName ?? "attachment.bin");
-  });
-  return el("div", { className: "file-message" }, [
-    el("div", { className: "file-icon", text: "📎" }),
-    fileInfo,
-    download
-  ]);
+  const icon = el("div", { className: "file-icon", text: "📎" });
+  if (message.fileBlob) {
+    const download = el("button", { className: "file-download", text: "下载" });
+    download.type = "button";
+    download.addEventListener("click", () => {
+      safeDownload(message.fileBlob!, message.fileName ?? "attachment.bin");
+    });
+    return el("div", { className: "file-message" }, [icon, fileInfo, download]);
+  }
+  const progress = message.fileProgress ?? 0;
+  if (progress < 0) {
+    fileInfo.append(el("div", { className: "file-progress-label failed", text: "发送失败" }));
+    return el("div", { className: "file-message transferring failed" }, [icon, fileInfo]);
+  }
+  const ratio = Math.max(0, Math.min(1, progress));
+  const bar = el("div", { className: "file-progress" });
+  const fill = el("div", { className: "file-progress-fill" });
+  fill.style.width = `${Math.round(ratio * 100)}%`;
+  bar.append(fill);
+  fileInfo.append(
+    el("div", {
+      className: "file-progress-label",
+      text: `传输中 ${Math.round(ratio * 100)}%`
+    })
+  );
+  return el("div", { className: "file-message transferring" }, [icon, fileInfo, bar]);
 }
 
 function renderComposer(state: Runtime): HTMLElement {
