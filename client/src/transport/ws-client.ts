@@ -191,6 +191,17 @@ export class WsClient {
     this.#socket = null;
   }
 
+  /**
+   * 强制断开底层连接但不标记“已关闭”：close 事件走正常重连流程
+   * （指数退避 + 新 connectionEpoch 重 join），用于密钥链路疑似失配时快速重置。
+   */
+  forceReconnect(): void {
+    if (this.#closed || !this.#socket) {
+      return;
+    }
+    this.#socket.close(1000, "force reconnect");
+  }
+
   #isStale(socket: WebSocket): boolean {
     return this.#socket !== null && this.#socket !== socket;
   }

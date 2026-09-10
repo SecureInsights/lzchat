@@ -77,8 +77,15 @@ export async function openPayload(
       return null;
     }
     plaintext = await aesGcmDecrypt(key, nonce, aad, base64urlDecode(envelope.ct));
+    const payload = validatePlainPayload(JSON.parse(fromUtf8(plaintext)));
+    if (!payload) {
+      // 载荷校验失败不占 seq 槽位（恢复密钥到 skipped 缓存），
+      // 使对端同 seq 的合法重传仍可解密，避免"能解但不合法"的载荷投毒窗口。
+      ratchet.restoreSkipped(envelope.seq, key);
+      return null;
+    }
     ratchet.markAccepted(envelope.seq);
-    return validatePlainPayload(JSON.parse(fromUtf8(plaintext)));
+    return payload;
   } catch {
     ratchet.restoreSkipped(envelope.seq, key);
     return null;

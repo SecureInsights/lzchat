@@ -215,8 +215,12 @@ function isValidMimeType(value: unknown): value is string {
   return typeof value === "string" && value.length <= 120 && MIME_TYPE_RE.test(value);
 }
 
+// 媒体 seq/timestamp 的实际界值（timestamp 单位为微秒）：
+// 1e12 覆盖 30fps 连续 3.7 年或 11.5 天连续通话，超出即可拒绝。
+const MAX_MEDIA_SEQ = 1_000_000_000_000;
+
 function isValidMediaSeq(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 9_007_199_254_740_991;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= MAX_MEDIA_SEQ;
 }
 
 function isValidDimension(value: unknown): value is number {
@@ -375,6 +379,23 @@ export function validatePlainPayload(value: unknown, depth = 0): PlainPayload | 
       ) {
         return null;
       }
+      if (
+        value.droppedAudioFps !== undefined &&
+        (typeof value.droppedAudioFps !== "number" ||
+          value.droppedAudioFps < 0 ||
+          value.droppedAudioFps > 120)
+      ) {
+        return null;
+      }
+      if (
+        value.audioDecodeQueue !== undefined &&
+        (typeof value.audioDecodeQueue !== "number" ||
+          !Number.isSafeInteger(value.audioDecodeQueue) ||
+          value.audioDecodeQueue < 0 ||
+          value.audioDecodeQueue > 256)
+      ) {
+        return null;
+      }
       return isTimestamp(value.createdAt) ? (value as PlainPayload) : null;
     case "call-media":
       if (
@@ -423,7 +444,14 @@ export function validateServerMessage(value: unknown, expectedRoomId?: string): 
   if (isObject(value) && value.v === 3 && value.t === "pong" && isValidRoomId(value.roomId) && (!expectedRoomId || value.roomId === expectedRoomId)) {
     return value as ServerMessage;
   }
-  if (isObject(value) && value.v === 3 && value.t === "error" && typeof value.code === "string") {
+  if (
+    isObject(value) &&
+    value.v === 3 &&
+    value.t === "error" &&
+    typeof value.code === "string" &&
+    value.code.length > 0 &&
+    value.code.length <= 40
+  ) {
     return value as ServerMessage;
   }
   return null;

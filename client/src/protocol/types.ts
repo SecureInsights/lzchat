@@ -96,6 +96,10 @@ export type PlainPayload =
       droppedFps?: number;
       /** 回报时刻解码器排队深度。 */
       decodeQueue?: number;
+      /** 2s 窗口内每秒丢失的音频秒数（解码队列丢弃 + jitter 溢出）。 */
+      droppedAudioFps?: number;
+      /** 回报时刻音频解码队列深度。 */
+      audioDecodeQueue?: number;
       createdAt: number
     }
   | {

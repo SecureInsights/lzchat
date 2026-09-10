@@ -40,7 +40,7 @@ import type {
   RelayKind,
   ServerMessage
 } from "./protocol/types";
-import { validateRelayEnvelope } from "./protocol/validator";
+import { validatePlainPayload, validateRelayEnvelope } from "./protocol/validator";
 import { safeDownload } from "./security/download";
 import { el, removeChildren, setDataset } from "./security/safe-dom";
 import { loadCachedDisplayName, saveCachedDisplayName } from "./storage";
@@ -64,6 +64,8 @@ type PeerRuntime = {
   mediaMessageWindow: number[];
   mediaByteWindow: Array<{ seenAt: number; bytes: number }>;
   seenControlSeq: Set<number>;
+  /** 本端 → 该 peer 的 call-control 单调计数器（取代基于时间戳的 seq，消除 2^53 远期溢出与碰撞）。 */
+  controlSeq: number;
   lastIncomingCallOfferAt: number;
   decryptFailures: number;
   lastFailureNoticeAt: number;
@@ -270,6 +272,10 @@ type EncodedCallPublisher = {
   audioSeq: number;
   lastKeyFrameAt: number;
   lastVideoEncodeAt: number;
+  /** 拥塞降档重配进行中标志：跨参数帧不能混流，重配期间跳过视频编码。 */
+  videoReconfiguring: boolean;
+  /** 最近一次重配完成时刻（拥塞降档冷却用）。 */
+  lastVideoReconfigureAt: number;
 };
 
 type EncodedCallReceiver = {
@@ -299,6 +305,8 @@ type CallParticipant = {
   droppedVideoFrames: number;
   /** 统计窗口起始时间戳。 */
   droppedWindowStart: number;
+  /** 当前回报窗口内累计丢失的音频秒数（解码队列丢弃 + jitter 溢出）。 */
+  droppedAudioSeconds: number;
 };
 
 type CallVideoProfile = {
@@ -332,6 +340,10 @@ type CallRuntime = {
   audioIndicatorDecayTimerId: number | null;
   /** 拥塞反馈档位：0 基准，1/2 降档（fps/码率上限收紧）。 */
   videoQualityTier: number;
+  /** 音频拥塞反馈档位：0 基准（48k），1（32k）/2（24k）降档。 */
+  audioQualityTier: number;
+  /** 音频档位最近一次重配完成时刻（冷却用）。 */
+  lastAudioReconfigureAt: number;
   /** 连续健康回报计数，达到阈值后回升一档。 */
   videoQualityHealthySamples: number;
   /** 接收端拥塞统计回报定时器。 */
@@ -354,6 +366,8 @@ type Runtime = {
   clientId: string;
   session: SessionKeys;
   capabilities: CapabilitySet;
+  /** 本端当前连接实例标识；随重连轮换并并入握手派生材料（阻断跨会话重放）。 */
+  connectionEpoch: string;
   ws: WsClient;
   peers: Map<string, PeerRuntime>;
   pendingRelays: Map<string, RelayEnvelope[]>;
@@ -455,6 +469,9 @@ const messageRows = new WeakMap<ChatMessage, HTMLElement>();
 const PEER_MESSAGE_WINDOW_MS = 10_000;
 const PEER_MAX_MESSAGES_PER_WINDOW = 120;
 const FAILURE_NOTICE_INTERVAL_MS = 5_000;
+// 同一 peer 连续解密失败达到该阈值（且来自非媒体通道）时，
+// 判定密钥链路疑似失配/中继被篡改，强制重连走新纪元全量重置棘轮。
+const PEER_DECRYPT_RECONNECT_THRESHOLD = 32;
 const NOTIFICATION_THROTTLE_MS = 900;
 const MAX_PENDING_RELAYS_PER_PEER = 32;
 const INVALID_PEER_NOTICE_MS = 60_000;
@@ -476,6 +493,9 @@ const CALL_QUALITY_REPORT_INTERVAL_MS = 2_000;
 const CALL_QUALITY_RECOVERY_SAMPLES = 3;
 const CALL_QUALITY_DROP_FPS_THRESHOLD = 1;
 const CALL_QUALITY_QUEUE_THRESHOLD = 8;
+// 降档重配冷却：N 个接收者按 2s 叠加回报时，档位计算每次都做，
+// 但编码器重配（+ 全流关键帧）最多每 2.5s 一次，避免重配风暴。
+const CALL_QUALITY_RECONFIGURE_COOLDOWN_MS = 2_500;
 const CALL_INCOMING_TIMEOUT_MS = 60_000;
 const CALL_RINGTONE_INTERVAL_MS = 1_700;
 const CALL_CONTROL_REPLAY_WINDOW = 256;
@@ -523,6 +543,12 @@ const CALL_VIDEO_HARDWARE_ACCELERATION: VideoEncoderConfigLike["hardwareAccelera
 ];
 const CALL_KEYFRAME_INTERVAL_MS = 2_000;
 const CALL_AUDIO_BITRATE = 48_000;
+// 音频拥塞降档码率：拥塞时先压语音码率保通话可用，再动视频。
+const CALL_AUDIO_QUALITY_BITRATES = [48_000, 32_000, 24_000];
+// 窗口内丢失音频超过 25%（秒数比率）即判定音频拥塞。
+const CALL_AUDIO_DROP_FPS_THRESHOLD = 0.25;
+const CALL_AUDIO_DECODE_QUEUE_THRESHOLD = 20;
+const CALL_AUDIO_RECONFIGURE_COOLDOWN_MS = 2_500;
 const CALL_VIDEO_CODECS = [
   "vp8",
   "vp09.00.10.08",
@@ -1478,6 +1504,7 @@ async function startRoom(input: {
       // 每次断开后更换连接实例标识，让对端能区分“同一连接的重复广播”和“新连接重进”。
       joinMessage.connectionEpoch = base64urlEncode(randomBytes(8));
       if (runtime) {
+        runtime.connectionEpoch = joinMessage.connectionEpoch;
         runtime.status = "已断开";
         renderChat();
       }
@@ -1500,6 +1527,7 @@ async function startRoom(input: {
     clientId,
     session,
     capabilities,
+    connectionEpoch: joinMessage.connectionEpoch,
     ws,
     peers: new Map(),
     pendingRelays: new Map(),
@@ -1601,8 +1629,10 @@ async function handleMembers(message: MembersMessage): Promise<void> {
         localPrivateKey: state.session.privateKey,
         localClientId: state.clientId,
         localSessionPub: state.session.publicKeyToken,
+        localConnectionEpoch: state.connectionEpoch,
         peerClientId: member.clientId,
         peerSessionPub: member.sessionPub,
+        peerConnectionEpoch: member.connectionEpoch,
         capabilities: state.capabilities
       });
     } catch {
@@ -1658,6 +1688,8 @@ async function handleMembers(message: MembersMessage): Promise<void> {
       mediaMessageWindow: previousMediaMessageWindow,
       mediaByteWindow: previousMediaByteWindow,
       seenControlSeq: previousSeenControlSeq,
+      // 连接纪元轮换时接收端 seen 集重置，本端计数器同步归零；纪元未变则延续，保持单调递增且无碰撞。
+      controlSeq: epochChanged ? 0 : existing?.controlSeq ?? 0,
       lastIncomingCallOfferAt: previousLastIncomingCallOfferAt,
       decryptFailures: 0,
       lastFailureNoticeAt: 0
@@ -1792,8 +1824,15 @@ async function handleRelay(envelope: RelayEnvelope, allowQueue = true): Promise<
       addSystemMessage(`${peer.displayName} 有密文未通过验证，已丢弃。`);
       peer.lastFailureNoticeAt = now;
     }
+    // 持续解密失败（非媒体通道）：密钥链路疑似失配，强制重连走新纪元重置棘轮。
+    if (envelope.kind !== "call-media" && peer.decryptFailures >= PEER_DECRYPT_RECONNECT_THRESHOLD) {
+      peer.decryptFailures = 0;
+      addSystemMessage("与对方的密钥链路疑似失配，正在重连重置。");
+      state.ws.forceReconnect();
+    }
     return;
   }
+  peer.decryptFailures = 0;
   if (envelope.from !== peer.clientId || peer.pair.peerClientId !== envelope.from) {
     return;
   }
@@ -1961,7 +2000,19 @@ function handleFileMeta(
   if (incoming.peerName) {
     placeholder.peerName = incoming.peerName;
   }
-  if (!state.messages.some((message) => message.id === placeholder.id)) {
+  // 重复 file-meta（断线重传等场景）：若旧占位仍在传输中（fileProgress 未删，
+  // 可能刚被 deleteIncomingFile 标记为失败），把数组里的对象替换为新占位，
+  // 使后续 chunk 进度更新与 file-done 转换都以新对象为准，并原位重建行；
+  // 若该 id 已被完成附件占用，则不追加新占位（避免重复传输显示）。
+  const placeholderIndex = state.messages.findIndex((item) => item.id === placeholder.id);
+  if (placeholderIndex >= 0) {
+    const existing = state.messages[placeholderIndex];
+    if (existing && existing.fileProgress !== undefined) {
+      state.messages[placeholderIndex] = placeholder;
+      placeholder.renderDirty = true;
+      renderChat();
+    }
+  } else {
     pushMessage(state, placeholder);
     renderChat();
   }
@@ -2240,7 +2291,9 @@ async function sendCallControlSignal(
   if (!state.ws.isOpen()) {
     return false;
   }
-  const seq = nextControlSeq();
+  // per-peer 单调计数器：每次重连（连接纪元轮换）随接收端 seen 集一起归零，
+  // 无需时间戳基数，消除 2^53 远期溢出与随机数碰撞。
+  const seq = ++peer.controlSeq;
   const aad = utf8(
     stableJson({
       v: 3,
@@ -2405,7 +2458,9 @@ function createCallParticipant(peer: PeerRuntime, status: CallParticipantStatus)
     audioLevel: 0,
     audioLevelAt: 0,
     droppedVideoFrames: 0,
-    droppedWindowStart: 0
+    // 统计窗口起点即时对齐，避免首窗窗口≈0ms 把等关键帧期的丢帧放大成拥塞误报。
+    droppedWindowStart: Date.now(),
+    droppedAudioSeconds: 0
   };
 }
 
@@ -2652,10 +2707,6 @@ async function callControlKey(peer: PeerRuntime): Promise<Uint8Array> {
   );
 }
 
-function nextControlSeq(): number {
-  return Date.now() * 1_000 + Math.floor(Math.random() * 1_000);
-}
-
 function acceptCallControl(peer: PeerRuntime, seq: number, createdAt: number): boolean {
   const now = Date.now();
   if (
@@ -2681,38 +2732,11 @@ function acceptCallControl(peer: PeerRuntime, seq: number, createdAt: number): b
 }
 
 function isCallControlPayload(value: unknown): value is CallControlPayload {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
-  }
-  const payload = value as Record<string, unknown>;
-  const validBase =
-    typeof payload.callId === "string" &&
-    /^[A-Za-z0-9_-]{1,128}$/u.test(payload.callId) &&
-    typeof payload.createdAt === "number" &&
-    Number.isSafeInteger(payload.createdAt) &&
-    payload.createdAt > 0;
-  if (!validBase) {
-    return false;
-  }
-  if (payload.type === "call-end") {
-    return (
-      payload.reason === undefined ||
-      (typeof payload.reason === "string" && payload.reason.length <= 120)
-    );
-  }
-  if (payload.type === "call-quality") {
-    const droppedFpsOk =
-      payload.droppedFps === undefined ||
-      (typeof payload.droppedFps === "number" &&
-        payload.droppedFps >= 0 &&
-        payload.droppedFps <= 120);
-    const queueOk =
-      payload.decodeQueue === undefined ||
-      (typeof payload.decodeQueue === "number" &&
-        Number.isSafeInteger(payload.decodeQueue) &&
-        payload.decodeQueue >= 0 &&
-        payload.decodeQueue <= 256);
-    return droppedFpsOk && queueOk;
+  // 单一校验源：call-control 通道复用 validatePlainPayload 的有界校验，
+  // 只放行 call-end / call-quality，消除与协议校验器双份维护的漂移风险。
+  const payload = validatePlainPayload(value);
+  if (payload && (payload.type === "call-end" || payload.type === "call-quality")) {
+    return true;
   }
   return false;
 }
@@ -2746,6 +2770,10 @@ function reportCallQuality(state: Runtime, call: CallRuntime): void {
     }
     const peer = state.peers.get(participant.peerId);
     if (!peer) {
+      // 对端已移除：重置窗口（含音频丢秒），避免重连后首窗把离线期间的旧丢帧误报为拥塞。
+      participant.droppedVideoFrames = 0;
+      participant.droppedAudioSeconds = 0;
+      participant.droppedWindowStart = now;
       continue;
     }
     const windowMs = Math.max(
@@ -2755,11 +2783,15 @@ function reportCallQuality(state: Runtime, call: CallRuntime): void {
     const droppedFps = (participant.droppedVideoFrames * 1000) / windowMs;
     participant.droppedVideoFrames = 0;
     participant.droppedWindowStart = now;
+    const droppedAudioFps = (participant.droppedAudioSeconds * 1000) / windowMs;
+    participant.droppedAudioSeconds = 0;
     const payload: Extract<PlainPayload, { type: "call-quality" }> = {
       type: "call-quality",
       callId: call.callId,
       droppedFps: Math.round(droppedFps * 10) / 10,
       decodeQueue: participant.receiver.videoDecoder?.decodeQueueSize ?? 0,
+      droppedAudioFps: Math.round(droppedAudioFps * 1000) / 1000,
+      audioDecodeQueue: participant.receiver.audioDecoder?.decodeQueueSize ?? 0,
       createdAt: now
     };
     void sendCallControlSignal(state, peer, payload).catch(() => undefined);
@@ -2772,15 +2804,32 @@ function handleCallQuality(
   payload: Extract<PlainPayload, { type: "call-quality" }>
 ): void {
   const call = state.call;
-  if (
-    !call ||
-    call.callId !== payload.callId ||
-    call.media !== "video" ||
-    !callHasParticipant(call, peer.clientId)
-  ) {
+  if (!call || call.callId !== payload.callId || !callHasParticipant(call, peer.clientId)) {
     return;
   }
-  if (!call.publisher || !call.publisher.videoEncoder) {
+  const publisher = call.publisher;
+  if (!publisher) {
+    return;
+  }
+  // 音频降档：优先压语音码率（48k→32k→24k）保通话可用，
+  // 音频拥塞与视频拥塞各自独立判定，互不牵连。
+  if (publisher.audioEncoder) {
+    const audioCongested =
+      (payload.droppedAudioFps ?? 0) > CALL_AUDIO_DROP_FPS_THRESHOLD ||
+      (payload.audioDecodeQueue ?? 0) > CALL_AUDIO_DECODE_QUEUE_THRESHOLD;
+    const maxAudioTier = CALL_AUDIO_QUALITY_BITRATES.length - 1;
+    if (audioCongested) {
+      if (call.audioQualityTier < maxAudioTier && canReconfigureCallAudio(call)) {
+        call.audioQualityTier += 1;
+        void reconfigureCallAudio(call, publisher);
+      }
+    } else if (call.audioQualityTier > 0 && canReconfigureCallAudio(call)) {
+      // 音频回升不加连续健康样本门控：语音质量恢复应即时，避免 2 个周期延迟。
+      call.audioQualityTier -= 1;
+      void reconfigureCallAudio(call, publisher);
+    }
+  }
+  if (call.media !== "video" || !publisher.videoEncoder) {
     return;
   }
   const maxTier = CALL_VIDEO_QUALITY_TIERS.length - 1;
@@ -2789,13 +2838,17 @@ function handleCallQuality(
     (payload.decodeQueue ?? 0) > CALL_QUALITY_QUEUE_THRESHOLD;
   if (congested) {
     call.videoQualityHealthySamples = 0;
-    if (call.videoQualityTier < maxTier) {
+    if (call.videoQualityTier < maxTier && canReconfigureCallVideo(publisher)) {
       call.videoQualityTier += 1;
       void reconfigureCallVideo(state, call);
     }
   } else {
     call.videoQualityHealthySamples += 1;
-    if (call.videoQualityHealthySamples >= CALL_QUALITY_RECOVERY_SAMPLES && call.videoQualityTier > 0) {
+    if (
+      call.videoQualityHealthySamples >= CALL_QUALITY_RECOVERY_SAMPLES &&
+      call.videoQualityTier > 0 &&
+      canReconfigureCallVideo(publisher)
+    ) {
       call.videoQualityTier -= 1;
       call.videoQualityHealthySamples = 0;
       void reconfigureCallVideo(state, call);
@@ -2803,21 +2856,66 @@ function handleCallQuality(
   }
 }
 
-async function reconfigureCallVideo(state: Runtime, call: CallRuntime): Promise<void> {
-  const publisher = call.publisher;
-  if (!publisher || !publisher.videoEncoder) {
+function canReconfigureCallAudio(call: CallRuntime): boolean {
+  return Date.now() - call.lastAudioReconfigureAt >= CALL_AUDIO_RECONFIGURE_COOLDOWN_MS;
+}
+
+async function reconfigureCallAudio(
+  call: CallRuntime,
+  publisher: EncodedCallPublisher
+): Promise<void> {
+  const encoder = publisher.audioEncoder;
+  if (!encoder || publisher.audioConfig === null) {
     return;
   }
+  const previousTier = call.audioQualityTier;
+  const bitrate =
+    CALL_AUDIO_QUALITY_BITRATES[
+      Math.min(call.audioQualityTier, CALL_AUDIO_QUALITY_BITRATES.length - 1)
+    ] ?? CALL_AUDIO_BITRATE;
+  const config: AudioEncoderConfigLike = { ...publisher.audioConfig, bitrate };
+  call.lastAudioReconfigureAt = Date.now();
   try {
+    // 码率对已编码帧不追溯，configure 即对后续帧生效，无需停顿跳帧。
+    encoder.configure(config);
+    publisher.audioConfig = config;
+  } catch {
+    // 重配失败：回滚档位，继续按原码率发送。
+    call.audioQualityTier = previousTier;
+  }
+}
+
+function canReconfigureCallVideo(publisher: EncodedCallPublisher): boolean {
+  // 重配冷却：N 个接收者按 2s 叠加回报时，档位计算每次都做，
+  // 但编码器重配（+ 全流关键帧）最多每 CALL_QUALITY_RECONFIGURE_COOLDOWN_MS 一次。
+  return !publisher.videoReconfiguring && Date.now() - publisher.lastVideoReconfigureAt >= CALL_QUALITY_RECONFIGURE_COOLDOWN_MS;
+}
+
+async function reconfigureCallVideo(state: Runtime, call: CallRuntime): Promise<void> {
+  const publisher = call.publisher;
+  if (!publisher || !publisher.videoEncoder || publisher.videoReconfiguring) {
+    return;
+  }
+  const previousTier = call.videoQualityTier;
+  publisher.videoReconfiguring = true;
+  try {
+    // 标志已置位，编码循环在此期间跳过出帧，避免跨参数帧混流导致花屏。
     const config = await selectVideoConfig(call);
+    if (publisher.closed || state.call !== call || call.publisher !== publisher) {
+      return;
+    }
     publisher.videoConfig = config;
     publisher.videoEncoder.configure(config);
     // 立即强制关键帧：下一帧走 key 路径，对端可快速同步新的编码参数，
     // 避免等待 2s 关键帧周期导致画面冻结。
     publisher.lastKeyFrameAt = 0;
     publisher.lastVideoEncodeAt = 0;
+    publisher.lastVideoReconfigureAt = Date.now();
   } catch {
-    // 重配失败时保留原配置，继续按旧参数发送。
+    // 重配失败：回滚档位，保留原配置继续按旧参数发送。
+    call.videoQualityTier = previousTier;
+  } finally {
+    publisher.videoReconfiguring = false;
   }
 }
 
@@ -3334,6 +3432,8 @@ async function startOutgoingCall(
     audioIndicatorFrameId: null,
     audioIndicatorDecayTimerId: null,
     videoQualityTier: 0,
+    audioQualityTier: 0,
+    lastAudioReconfigureAt: 0,
     videoQualityHealthySamples: 0,
     qualityReportTimerId: null,
     createdAt: Date.now()
@@ -3343,6 +3443,17 @@ async function startOutgoingCall(
   }
   state.call = call;
   state.privatePeerId = scope === "private" ? primary.clientId : null;
+  // 主叫侧对称振铃超时：被叫 60s 未接听（且未回 call-answer）时本地清理通话，
+  // 避免主叫永远停在“呼叫中”占用本地媒体管线。status 变为 active 后守卫自动失效。
+  call.incomingTimerId = window.setTimeout(() => {
+    if (runtime !== state || state.call !== call || call.status !== "connecting") {
+      return;
+    }
+    state.call = null;
+    cleanupCall(call);
+    addSystemMessage("对方未接听，通话已取消。");
+    renderChat();
+  }, CALL_INCOMING_TIMEOUT_MS);
   renderChat();
   try {
     const permissionNotice = await describeMediaPermissions(media);
@@ -3491,11 +3602,8 @@ async function handleCallSignal(
     if (state.call?.callId === payload.callId && callHasParticipant(state.call, peer.clientId)) {
       return;
     }
-    if (state.call && state.call.callId !== payload.callId) {
-      sendCallEndSignal(state, peer, payload.callId, "busy");
-      return;
-    }
-    peer.lastIncomingCallOfferAt = Date.now();
+    // 先做定向过滤：targetIds 不含自己的 offer 静默忽略，
+    // 避免对自己未参与的通话误发 busy 终止信令。
     if (
       payload.targetIds &&
       payload.targetIds.length > 0 &&
@@ -3503,6 +3611,11 @@ async function handleCallSignal(
     ) {
       return;
     }
+    if (state.call && state.call.callId !== payload.callId) {
+      sendCallEndSignal(state, peer, payload.callId, "busy");
+      return;
+    }
+    peer.lastIncomingCallOfferAt = Date.now();
     const targetIds =
       payload.targetIds && payload.targetIds.length > 0 ? payload.targetIds : [state.clientId];
     const scope: CallScope = targetIds.length > 1 ? "room" : "private";
@@ -3541,6 +3654,8 @@ async function handleCallSignal(
       audioIndicatorFrameId: null,
       audioIndicatorDecayTimerId: null,
       videoQualityTier: 0,
+      audioQualityTier: 0,
+      lastAudioReconfigureAt: 0,
       videoQualityHealthySamples: 0,
       qualityReportTimerId: null,
       createdAt: payload.createdAt
@@ -3606,10 +3721,18 @@ async function handleCallSignal(
       try {
         call.status = "active";
         await startEncodedPublisher(state, call);
+        // 重入保护：await 期间 call-end/重连/destroy 可能已拆除本通话，
+        // 此时不得在死通话上继续渲染或保留管线。
+        if (runtime !== state || state.call !== call) {
+          cleanupCall(call);
+          return;
+        }
         renderChat();
       } catch {
-        cleanupCall(call);
-        state.call = null;
+        if (runtime === state && state.call === call) {
+          cleanupCall(call);
+          state.call = null;
+        }
         renderChat();
         addSystemMessage("通话媒体启动失败，已结束通话。");
         for (const target of callPeers(state, call)) {
@@ -3677,12 +3800,20 @@ async function startEncodedPublisher(state: Runtime, call: CallRuntime): Promise
     videoSeq: 0,
     audioSeq: 0,
     lastKeyFrameAt: 0,
-    lastVideoEncodeAt: 0
+    lastVideoEncodeAt: 0,
+    videoReconfiguring: false,
+    lastVideoReconfigureAt: 0
   };
   call.publisher = publisher;
   let startedTrack = false;
   if (call.media === "video") {
     await startEncodedVideo(state, call, publisher);
+    // 重入保护：视频管线启动期间通话可能已被 call-end/重连拆除；
+    // 拆除路径已置 publisher.closed，此处必须中止，不得在死通话上继续建音频管线。
+    if (publisher.closed || runtime !== state || state.call !== call) {
+      call.publisher = null;
+      return;
+    }
     startedTrack = true;
   }
   const startedAudio = await startEncodedAudio(state, call, publisher);
@@ -3735,6 +3866,11 @@ async function startEncodedVideo(
   const videoConfig = publisher.videoConfig;
   const encodeFrame = (now: number, metadata: { mediaTime?: number } | null) => {
     if (publisher.closed || runtime !== state || state.call !== call || !publisher.videoEncoder) {
+      return;
+    }
+    // 降档重配进行中：跳过出帧，避免跨参数帧混流导致花屏并污染丢帧统计；
+    // 重配完成后 lastKeyFrameAt=0，下一帧即为关键帧，对端可快速同步新参数。
+    if (publisher.videoReconfiguring) {
       return;
     }
     const queueSize = publisher.videoEncoder.encodeQueueSize;
@@ -3895,6 +4031,8 @@ async function startEncodedAudio(
     void readEncodedAudioFrames(call, publisher);
     return true;
   } catch {
+    // 异常路径关闭已创建的编码器，避免泄漏 AudioEncoder 实例。
+    closeMediaCodecSafe(publisher.audioEncoder);
     publisher.audioEncoder = null;
     publisher.audioReader = null;
     return false;
@@ -3975,6 +4113,21 @@ function handleMediaSendFailure(call: CallRuntime): void {
   addSystemMessage("媒体发送连续失败，正在尝试恢复。");
 }
 
+/** 安全关闭 WebCodecs 编解码器：同步 throw 与异步 reject 双兜底。 */
+function closeMediaCodecSafe(codec: { close(): unknown } | null | undefined): void {
+  if (!codec) {
+    return;
+  }
+  try {
+    const result = codec.close();
+    if (result && typeof (result as Promise<unknown>).catch === "function") {
+      (result as Promise<unknown>).catch(() => undefined);
+    }
+  } catch {
+    // Already closed.
+  }
+}
+
 function cleanupEncodedPublisher(publisher: EncodedCallPublisher | null): void {
   if (!publisher) {
     return;
@@ -3987,16 +4140,8 @@ function cleanupEncodedPublisher(publisher: EncodedCallPublisher | null): void {
     window.clearInterval(publisher.videoIntervalId);
   }
   publisher.audioReader?.cancel().catch(() => undefined);
-  try {
-    publisher.videoEncoder?.close();
-  } catch {
-    // Already closed.
-  }
-  try {
-    publisher.audioEncoder?.close();
-  } catch {
-    // Already closed.
-  }
+  closeMediaCodecSafe(publisher.videoEncoder);
+  closeMediaCodecSafe(publisher.audioEncoder);
   if (publisher.captureVideo) {
     publisher.captureVideo.srcObject = null;
   }
@@ -4007,16 +4152,8 @@ function cleanupEncodedPublisher(publisher: EncodedCallPublisher | null): void {
 }
 
 function cleanupEncodedReceiver(receiver: EncodedCallReceiver): void {
-  try {
-    receiver.videoDecoder?.close();
-  } catch {
-    // Already closed.
-  }
-  try {
-    receiver.audioDecoder?.close();
-  } catch {
-    // Already closed.
-  }
+  closeMediaCodecSafe(receiver.videoDecoder);
+  closeMediaCodecSafe(receiver.audioDecoder);
   receiver.audioContext?.close().catch(() => undefined);
   receiver.videoDecoder = null;
   receiver.audioDecoder = null;
@@ -4090,7 +4227,7 @@ function decodeCallVideo(
   const configKey = `${payload.codec}:${payload.width}:${payload.height}`;
   try {
     if (!receiver.videoDecoder || receiver.videoConfigKey !== configKey) {
-      receiver.videoDecoder?.close();
+      closeMediaCodecSafe(receiver.videoDecoder);
       receiver.videoDecoder = new codecs.VideoDecoder({
         output: (frame) => {
           try {
@@ -4114,7 +4251,7 @@ function decodeCallVideo(
       receiver.gotVideoKeyFrame = false;
     }
   } catch {
-    receiver.videoDecoder?.close();
+    closeMediaCodecSafe(receiver.videoDecoder);
     receiver.videoDecoder = null;
     receiver.videoConfigKey = "";
     receiver.gotVideoKeyFrame = false;
@@ -4183,7 +4320,7 @@ function decodeCallAudio(participant: CallParticipant, payload: CallMediaPayload
   const configKey = `${payload.codec}:${payload.sampleRate}:${payload.numberOfChannels}`;
   try {
     if (!receiver.audioDecoder || receiver.audioConfigKey !== configKey) {
-      receiver.audioDecoder?.close();
+      closeMediaCodecSafe(receiver.audioDecoder);
       receiver.audioDecoder = new codecs.AudioDecoder({
         output: (audioData) => {
           try {
@@ -4202,12 +4339,15 @@ function decodeCallAudio(participant: CallParticipant, payload: CallMediaPayload
       receiver.audioConfigKey = configKey;
     }
   } catch {
-    receiver.audioDecoder?.close();
+    closeMediaCodecSafe(receiver.audioDecoder);
     receiver.audioDecoder = null;
     receiver.audioConfigKey = "";
     return;
   }
   if (receiver.audioDecoder.decodeQueueSize > 20) {
+    // 解码队列溢出丢弃：计入音频丢秒（拥塞反馈统计），
+    // duration 单位微秒；累计后经 call-quality 回传驱动发送端降码率。
+    participant.droppedAudioSeconds += Math.max(0, payload.duration) / 1_000_000;
     return;
   }
   const data = base64urlDecode(payload.bytes);
@@ -4269,7 +4409,9 @@ function playDecodedAudio(participant: CallParticipant, audioData: AudioDataLike
   audioData.close();
   const now = context.currentTime;
   if (receiver.nextAudioTime - now > CALL_MAX_AUDIO_QUEUE_DELAY_SEC) {
-    receiver.nextAudioTime = now + 0.05;
+    // 漂移校正：起播点拉回当前时刻（而非 50ms 前导），
+    // 使后续走欠载蓄水路径——攒满 100ms 再泵入，避免用不足 100ms 的队列硬拼出断续。
+    receiver.nextAudioTime = now;
   }
   const seconds = buffer.duration;
   receiver.audioPending.push({ buffer, seconds });
@@ -4277,6 +4419,8 @@ function playDecodedAudio(participant: CallParticipant, audioData: AudioDataLike
   while (receiver.audioPendingSeconds > CALL_AUDIO_JITTER_MAX_SECONDS && receiver.audioPending.length > 1) {
     const dropped = receiver.audioPending.shift()!;
     receiver.audioPendingSeconds -= dropped.seconds;
+    // jitter 队列溢出丢弃旧帧：计入音频丢秒（拥塞反馈统计）。
+    participant.droppedAudioSeconds += dropped.seconds;
   }
   const chainAhead = receiver.nextAudioTime > now;
   if (!chainAhead && receiver.audioPendingSeconds < CALL_AUDIO_JITTER_FILL_SECONDS) {
@@ -4284,7 +4428,9 @@ function playDecodedAudio(participant: CallParticipant, audioData: AudioDataLike
     return;
   }
   if (!chainAhead) {
-    receiver.nextAudioTime = now + 0.03;
+    // 欠载恢复：队列已攒到 100ms+，立即从当前时刻起播（首帧由下方 5ms 钳位保证不提前），
+    // 不再预留 30ms 可感静默。
+    receiver.nextAudioTime = now;
   }
   for (const item of receiver.audioPending) {
     const source = context.createBufferSource();
@@ -5502,7 +5648,14 @@ function showInviteDialog(
     notice
   );
   if (mode !== "two-channel") {
-    dialog.append(el("div", { className: "warning", text: "链接被转发即获得进入能力。" }));
+    // 单链接模式下 #i= 即全部房间密钥；分享前它可能已写入浏览器历史 / 转发渠道，
+    // 无法事后撤销（换房间即换密钥）。UI 明示“链接等同凭证、谨慎分享、敏感房间改用双通道”。
+    dialog.append(
+      el("div", {
+        className: "warning",
+        text: "单链接模式：该链接本身即全部进入密钥，任何拿到链接的人可直接进房，且无法单独撤销。链接可能已写入浏览器历史与转发渠道，请谨慎分享；重要房间建议改用双通道（链接 + 安全秘钥分渠道发送）。"
+      })
+    );
   }
   backdrop.append(dialog);
   document.body.append(backdrop);

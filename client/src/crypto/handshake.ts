@@ -53,8 +53,12 @@ export async function derivePairSession(input: {
   localPrivateKey: CryptoKey;
   localClientId: string;
   localSessionPub: string;
+  /** 本端当前连接实例标识；随重连轮换，使棘轮链每次重连都不同，阻断跨会话重放与 nonce 碰撞。 */
+  localConnectionEpoch: string;
   peerClientId: string;
   peerSessionPub: string;
+  /** 对端当前连接实例标识（来自 members 广播）。 */
+  peerConnectionEpoch: string;
   capabilities: CapabilitySet;
 }): Promise<PairSession> {
   const peerPublicKey = await importPeerPublicKey(input.peerSessionPub);
@@ -62,8 +66,16 @@ export async function derivePairSession(input: {
     await subtle().deriveBits({ name: "ECDH", public: peerPublicKey }, input.localPrivateKey, 256)
   );
   const participants = [
-    { clientId: input.localClientId, sessionPub: input.localSessionPub },
-    { clientId: input.peerClientId, sessionPub: input.peerSessionPub }
+    {
+      clientId: input.localClientId,
+      sessionPub: input.localSessionPub,
+      epoch: input.localConnectionEpoch
+    },
+    {
+      clientId: input.peerClientId,
+      sessionPub: input.peerSessionPub,
+      epoch: input.peerConnectionEpoch
+    }
   ].sort((a, b) => a.clientId.localeCompare(b.clientId) || a.sessionPub.localeCompare(b.sessionPub));
   const transcript = stableJson({
     v: 3,

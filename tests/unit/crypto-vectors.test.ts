@@ -31,14 +31,18 @@ describe("pairwise crypto", () => {
     const alice = await generateSessionKeys();
     const bob = await generateSessionKeys();
     const capabilities: CapabilitySet = { ratchet: "v1", aead: "aes-gcm", file: true, maxRelayBytes: 8 * 1024 * 1024 };
+    const aliceEpoch = base64urlEncode(new Uint8Array(8).fill(1));
+    const bobEpoch = base64urlEncode(new Uint8Array(8).fill(2));
     const alicePair = await derivePairSession({
       roomId: room.roomId,
       roomPsk: room.roomPsk,
       localPrivateKey: alice.privateKey,
       localClientId: "alicealicealice1",
       localSessionPub: alice.publicKeyToken,
+      localConnectionEpoch: aliceEpoch,
       peerClientId: "bobbobbobbobbob2",
       peerSessionPub: bob.publicKeyToken,
+      peerConnectionEpoch: bobEpoch,
       capabilities
     });
     const bobPair = await derivePairSession({
@@ -47,8 +51,10 @@ describe("pairwise crypto", () => {
       localPrivateKey: bob.privateKey,
       localClientId: "bobbobbobbobbob2",
       localSessionPub: bob.publicKeyToken,
+      localConnectionEpoch: bobEpoch,
       peerClientId: "alicealicealice1",
       peerSessionPub: alice.publicKeyToken,
+      peerConnectionEpoch: aliceEpoch,
       capabilities
     });
     expect(alicePair.transcriptHash).toBe(bobPair.transcriptHash);
