@@ -963,6 +963,83 @@ textarea:disabled {
   width: clamp(680px, 74vw, 1080px);
 }
 
+/* PIP 收起态：小悬浮窗，不遮挡聊天 */
+.call-panel.collapsed {
+  width: 200px;
+  min-width: 0;
+  right: 18px;
+  bottom: 92px;
+  gap: 6px;
+  padding: 8px;
+}
+
+.call-panel.collapsed .call-avatar {
+  width: 26px;
+  height: 26px;
+  font-size: 11px;
+}
+
+.call-panel.collapsed .call-title {
+  font-size: 12px;
+}
+
+.call-panel.collapsed .call-subtitle {
+  display: none;
+}
+
+.call-panel.collapsed .call-stage {
+  aspect-ratio: auto;
+  height: 72px;
+  min-height: 0;
+  border-radius: 8px;
+}
+
+.call-panel.collapsed .call-remote-grid {
+  grid-template-columns: 1fr;
+  padding: 4px;
+  gap: 4px;
+}
+
+.call-panel.collapsed .call-remote-tile {
+  min-height: 0;
+}
+
+.call-panel.collapsed .call-local-wrap {
+  right: 6px;
+  bottom: 6px;
+  width: min(44%, 84px);
+  border-width: 1px;
+}
+
+.call-panel.collapsed .call-audio-peer {
+  min-height: 0;
+  padding: 6px;
+  gap: 2px;
+}
+
+.call-panel.collapsed .call-audio-avatar {
+  width: 24px;
+  height: 24px;
+  font-size: 10px;
+}
+
+.call-panel.collapsed .call-audio-name,
+.call-panel.collapsed .call-audio-state {
+  font-size: 10px;
+}
+
+.call-panel.collapsed .call-controls {
+  flex-wrap: nowrap;
+  gap: 4px;
+}
+
+.call-panel.collapsed .call-control {
+  flex: 1 1 auto;
+  min-height: 26px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
 .call-status {
   display: flex;
   align-items: center;
@@ -1968,23 +2045,77 @@ textarea:disabled {
   }
 
   .call-panel {
-    inset: 0;
+    top: auto;
+    left: 10px;
+    right: 10px;
+    bottom: calc(10px + env(safe-area-inset-bottom));
     width: auto;
     min-width: 0;
-    min-height: 100dvh;
+    min-height: 0;
+    max-height: 62dvh;
     grid-template-rows: auto minmax(0, 1fr) auto;
-    gap: 12px;
-    padding: max(14px, env(safe-area-inset-top)) 12px calc(14px + env(safe-area-inset-bottom));
+    gap: 8px;
+    padding: 10px;
     border: 0;
-    border-radius: 0;
+    border-radius: 16px;
     background: #07111d;
     color: #f8fafc;
-    box-shadow: none;
+    box-shadow: 0 14px 40px rgba(15, 23, 42, 0.4);
+    overflow: hidden;
   }
 
   .call-panel.audio {
     width: auto;
-    min-height: 100dvh;
+    min-height: 0;
+    max-height: 42dvh;
+  }
+
+  /* PIP 收起态：右上角小悬浮窗，让出聊天区 */
+  .call-panel.collapsed {
+    top: calc(8px + env(safe-area-inset-top));
+    left: auto;
+    right: 10px;
+    bottom: auto;
+    width: min(46vw, 190px);
+    max-height: none;
+    gap: 4px;
+    padding: 8px;
+  }
+
+  .call-panel.collapsed .call-subtitle {
+    display: none;
+  }
+
+  .call-panel.collapsed .call-stage {
+    height: 56px;
+  }
+
+  .call-panel.collapsed .call-audio-peer {
+    min-height: 0;
+  }
+
+  .call-panel.collapsed .call-remote-grid {
+    grid-template-columns: 1fr;
+    padding: 4px;
+    gap: 4px;
+  }
+
+  .call-panel.collapsed .call-controls {
+    flex-wrap: nowrap;
+    gap: 4px;
+  }
+
+  .call-panel.collapsed .call-local-wrap {
+    right: 6px;
+    bottom: 6px;
+    width: 42%;
+  }
+
+  .call-panel.collapsed .call-control {
+    flex: 1 1 auto;
+    min-height: 28px;
+    padding: 0 6px;
+    font-size: 11px;
   }
 
   .call-panel .call-title {

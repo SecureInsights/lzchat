@@ -2972,10 +2972,14 @@ async function reconfigureCallVideo(state: Runtime, call: CallRuntime): Promise<
   }
 }
 
+// 通话面板 PIP 收起态：true 时面板渲染为小悬浮窗，不遮挡聊天；通话结束时复位。
+let callPanelCollapsed = false;
+
 function cleanupCall(call: CallRuntime | null): void {
   if (!call) {
     return;
   }
+  callPanelCollapsed = false;
   stopCallRingtone(call);
   stopCallQualityReporting(call);
   if (call.incomingTimerId !== null) {
@@ -5339,7 +5343,9 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
     return null;
   }
   const isIncoming = call.status === "incoming";
-  const panel = el("section", { className: ["call-panel", call.media, call.scope].join(" ") });
+  const panel = el("section", {
+    className: ["call-panel", call.media, call.scope, callPanelCollapsed ? "collapsed" : ""].join(" ")
+  });
   const liveCount = [...call.participants.values()].filter(
     (participant) => participant.status === "active"
   ).length;
@@ -5486,6 +5492,28 @@ function renderCallLayer(state: Runtime): HTMLElement | null {
       void finishCall("ended", true);
     });
     actions.append(hangup);
+    if (callPanelCollapsed) {
+      const expand = el("button", { className: "call-control expand", text: "展开" });
+      expand.type = "button";
+      expand.addEventListener("click", () => {
+        callPanelCollapsed = false;
+        renderChat();
+      });
+      actions.append(expand);
+    } else {
+      const minimize = el("button", {
+        className: "call-control minimize",
+        text: "最小化",
+        title: "收起为悬浮窗",
+        ariaLabel: "收起为悬浮窗"
+      });
+      minimize.type = "button";
+      minimize.addEventListener("click", () => {
+        callPanelCollapsed = true;
+        renderChat();
+      });
+      actions.append(minimize);
+    }
   }
   panel.append(status, mediaStage, actions);
   window.requestAnimationFrame(() => {
