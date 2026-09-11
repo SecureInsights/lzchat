@@ -1,4 +1,4 @@
-name = "secure-chat"
+name = "lzchat"
 main = "worker/dist/index.js"
 compatibility_date = "2026-07-07"
 
