@@ -16,9 +16,15 @@
   box-sizing: border-box;
 }
 
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
   margin: 0;
   min-width: 320px;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: contain;
 }
 
 button,
@@ -31,6 +37,7 @@ select {
 button {
   border: 0;
   cursor: pointer;
+  touch-action: manipulation;
 }
 
 button:disabled,
@@ -1404,18 +1411,85 @@ textarea:disabled {
 @media (max-width: 760px) {
   .login-screen {
     align-items: stretch;
+    justify-content: center;
     min-height: 100dvh;
-    padding: 14px 10px;
+    padding:
+      calc(18px + env(safe-area-inset-top))
+      14px
+      calc(18px + env(safe-area-inset-bottom));
   }
 
   .login-panel {
     align-self: center;
-    padding: 20px 15px;
-    border-radius: 12px;
+    width: min(100%, 480px);
+    margin: auto;
+    padding: 22px 18px;
+    border-radius: 18px;
+    box-shadow: 0 14px 44px rgba(26, 39, 64, 0.1);
+  }
+
+  .brand {
+    gap: 9px;
+    font-size: 17px;
+  }
+
+  .brand-mark {
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
   }
 
   .login-panel h1 {
-    font-size: 24px;
+    font-size: 22px;
+    margin-bottom: 8px;
+  }
+
+  .login-panel > .subtle {
+    font-size: 13px;
+  }
+
+  .form-grid {
+    gap: 12px;
+    margin-top: 18px;
+  }
+
+  .field {
+    font-size: 13px;
+  }
+
+  .field input,
+  .field textarea,
+  .field select {
+    padding: 11px 12px;
+    border-radius: 10px;
+    font-size: 16px; /* 16px 以下 iOS 聚焦会自动放大 */
+  }
+
+  .input-row .icon-button {
+    width: 40px;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0;
+    border-radius: 9px;
+    font-size: 16px;
+  }
+
+  .segmented button {
+    min-height: 34px;
+    font-size: 14px;
+  }
+
+  .login-panel .primary,
+  .login-panel .secondary {
+    min-height: 44px;
+    border-radius: 10px;
+    font-size: 15px;
+  }
+
+  .invite-output {
+    margin-top: 16px;
+    padding: 12px;
+    gap: 8px;
   }
 
   .chat-layout {
@@ -1437,12 +1511,12 @@ textarea:disabled {
   }
 
   .room-head {
-    padding: 9px 12px 7px;
-    gap: 2px;
+    padding: 8px 12px 4px;
+    gap: 3px;
   }
 
   .room-title {
-    font-size: 16px;
+    font-size: 15px;
     line-height: 1.25;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1451,6 +1525,7 @@ textarea:disabled {
   }
 
   .room-head .safety-line {
+    font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1459,13 +1534,13 @@ textarea:disabled {
 
   .member-list {
     display: flex;
-    gap: 7px;
-    min-height: 70px;
-    padding: 7px 8px 8px;
+    gap: 6px;
+    padding: 4px 12px 10px;
     overflow-x: auto;
     overflow-y: hidden;
     overscroll-behavior-x: contain;
     scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
   }
 
   .member-list::-webkit-scrollbar {
@@ -1473,36 +1548,84 @@ textarea:disabled {
   }
 
   .member {
-    width: 178px;
-    min-width: 178px;
-    min-height: 52px;
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    gap: 8px;
-    padding: 7px;
-    border-radius: 9px;
-    background: #f7fbff;
+    position: relative;
+    flex: 0 0 auto;
+    width: 66px;
+    min-width: 66px;
+    min-height: 0;
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto;
+    justify-items: center;
+    align-content: start;
+    gap: 5px;
+    padding: 8px 4px 6px;
+    border: 1px solid #e4ebf2;
+    border-radius: 14px;
+    background: #ffffff;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
   }
 
   .member-button {
-    width: 178px;
+    width: 66px;
+  }
+
+  .member-button:hover {
+    border-color: #b7d6ea;
   }
 
   .member-button.active {
-    background: #e3f2ff;
+    border-color: rgba(42, 171, 238, 0.55);
+    background: #e8f4ff;
+    box-shadow: 0 2px 8px rgba(42, 171, 238, 0.14);
   }
 
   .member-avatar {
-    width: 34px;
-    height: 34px;
-    font-size: 13px;
+    width: 38px;
+    height: 38px;
+    font-size: 14px;
+  }
+
+  .member-content {
+    grid-row: 2;
+    width: 100%;
+    justify-items: center;
   }
 
   .member-name {
-    font-size: 13px;
+    font-size: 11px;
+    color: #344255;
+    max-width: 100%;
   }
 
   .member-subtitle {
-    font-size: 11px;
+    display: none;
+  }
+
+  .member .badge {
+    position: absolute;
+    top: 2px;
+    right: 4px;
+    z-index: 2;
+    min-width: 18px;
+    min-height: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: #c2cfdb;
+    color: #344255;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 18px;
+  }
+
+  .member .badge:not(.unread) {
+    display: none;
+  }
+
+  .member .badge.unread {
+    background: #ef4444;
+    color: #ffffff;
+    box-shadow: 0 0 0 2px #fff;
   }
 
   .badge {
@@ -1522,9 +1645,15 @@ textarea:disabled {
     min-height: 0;
     display: grid;
     grid-template-columns: minmax(0, 1fr);
-    align-items: stretch;
-    gap: 7px;
-    padding: 8px 10px 7px;
+    align-items: center;
+    gap: 6px;
+    padding:
+      calc(8px + env(safe-area-inset-top))
+      calc(12px + env(safe-area-inset-right))
+      8px
+      calc(12px + env(safe-area-inset-left));
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(10px);
   }
 
   .chat-heading {
@@ -1532,10 +1661,11 @@ textarea:disabled {
   }
 
   .chat-heading-title {
-    font-size: 14px;
+    font-size: 15px;
   }
 
   .chat-heading-meta {
+    font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1551,6 +1681,7 @@ textarea:disabled {
     gap: 6px;
     padding-bottom: 2px;
     scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
   }
 
   .topbar-actions::-webkit-scrollbar {
@@ -1558,37 +1689,51 @@ textarea:disabled {
   }
 
   .topbar .secondary {
+    flex: 0 0 auto;
     min-height: 30px;
-    padding: 0 10px;
+    padding: 0 12px;
+    border-radius: 999px;
     font-size: 12px;
+    background: #eef5fb;
+    color: #236b93;
+  }
+
+  .topbar .secondary.active {
+    background: #d9f1ff;
+    color: #147eb8;
   }
 
   .mode-banner {
-    max-width: calc(100% - 16px);
-    margin: 7px 8px 0;
-    padding: 6px 10px;
+    justify-self: stretch;
+    width: 100%;
+    max-width: calc(100% - 24px);
+    margin: 6px 12px 0;
+    padding: 5px 10px;
+    border-radius: 999px;
     font-size: 11px;
+    text-align: center;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
   }
 
   .messages {
-    padding: 9px 8px 10px;
-    gap: 6px;
+    padding: 10px 10px 12px;
+    gap: 8px;
     overflow-y: auto;
     overscroll-behavior: contain;
   }
 
   .message {
-    max-width: 90%;
-    padding: 7px 10px 8px;
-    border-radius: 13px 13px 13px 5px;
+    max-width: 88%;
+    padding: 8px 11px 9px;
+    border-radius: 14px 14px 14px 5px;
     font-size: 14px;
   }
 
   .message.own {
-    border-radius: 13px 13px 5px 13px;
+    border-radius: 14px 14px 5px 14px;
   }
 
   .message-meta {
@@ -1621,74 +1766,150 @@ textarea:disabled {
 
   .composer {
     grid-template-columns: minmax(0, 1fr) auto;
-    padding: 8px calc(8px + env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom))
-      calc(8px + env(safe-area-inset-left));
-    gap: 7px;
+    padding:
+      8px
+      calc(10px + env(safe-area-inset-right))
+      calc(8px + env(safe-area-inset-bottom))
+      calc(10px + env(safe-area-inset-left));
+    gap: 6px;
+    background: rgba(244, 249, 252, 0.94);
   }
 
   .composer-pill {
-    min-height: 48px;
-    grid-template-columns: 32px minmax(0, 1fr) 32px;
-    gap: 6px;
-    border-radius: 18px;
-    padding: 0 8px;
+    min-height: 44px;
+    grid-template-columns: 38px minmax(0, 1fr) 38px;
+    gap: 4px;
+    border-radius: 24px;
+    padding: 0 6px;
+    box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06);
   }
 
   .composer textarea {
-    min-height: 34px;
-    max-height: 82px;
-    padding: 7px 2px;
+    min-height: 36px;
+    max-height: 88px;
+    padding: 7px 4px;
     line-height: 1.3;
+    font-size: 15px;
   }
 
   .emoji-button,
   .attach-button {
-    width: 32px;
-    min-width: 32px;
-    min-height: 32px;
-    font-size: 20px;
+    width: 36px;
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+    font-size: 19px;
   }
 
   .send-button {
-    width: 48px;
-    min-width: 48px;
-    min-height: 48px;
-    font-size: 21px;
+    width: 44px;
+    min-width: 44px;
+    min-height: 44px;
+    font-size: 19px;
   }
 
   .emoji-panel {
     position: fixed;
-    left: 8px;
-    right: 8px;
-    bottom: calc(66px + env(safe-area-inset-bottom));
-    width: auto;
-    height: min(390px, 56dvh);
-    border-radius: 12px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    height: min(400px, 55dvh);
+    border: 0;
+    border-radius: 16px 16px 0 0;
     z-index: 19;
+    padding: 10px 10px calc(10px + env(safe-area-inset-bottom));
+    box-shadow: 0 -12px 36px rgba(15, 23, 42, 0.18);
+    background: #ffffff;
+    animation: emoji-sheet-up 160ms ease-out;
+  }
+
+  @keyframes emoji-sheet-up {
+    from {
+      transform: translateY(24px);
+      opacity: 0.4;
+    }
+
+    to {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  }
+
+  .emoji-panel::before {
+    content: "";
+    position: absolute;
+    top: 6px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 40px;
+    height: 4px;
+    border-radius: 2px;
+    background: #cbd5e1;
   }
 
   .emoji-grid {
-    grid-template-columns: repeat(7, minmax(0, 1fr));
+    grid-template-columns: repeat(8, minmax(0, 1fr));
   }
 
   .emoji-item {
-    font-size: 21px;
+    font-size: 22px;
+    min-width: 0;
   }
 
   .modal-backdrop {
     align-items: end;
-    padding: 12px;
+    padding:
+      0
+      calc(8px + env(safe-area-inset-right))
+      calc(8px + env(safe-area-inset-bottom))
+      calc(8px + env(safe-area-inset-left));
+    background: rgba(15, 23, 42, 0.45);
   }
 
   .dialog {
-    max-height: min(86dvh, 720px);
+    width: 100%;
+    max-width: 100%;
+    max-height: min(88dvh, 720px);
     overflow: auto;
-    padding: 16px;
-    border-radius: 14px;
+    overscroll-behavior: contain;
+    padding: 18px 16px 16px;
+    border-radius: 20px 20px 0 0;
+    border-top: 0;
+    animation: dialog-sheet-up 180ms ease-out;
+  }
+
+  @keyframes dialog-sheet-up {
+    from {
+      transform: translateY(32px);
+      opacity: 0.5;
+    }
+
+    to {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  }
+
+  .dialog::before {
+    content: "";
+    display: block;
+    width: 40px;
+    height: 4px;
+    margin: 0 auto 10px;
+    border-radius: 2px;
+    background: #cbd5e1;
   }
 
   .dialog h2 {
     font-size: 18px;
+  }
+
+  .dialog-close {
+    top: 14px;
+    right: 14px;
+    width: 36px;
+    height: 36px;
   }
 
   .invite-share-grid {
@@ -1855,18 +2076,18 @@ textarea:disabled {
 
   .member,
   .member-button {
-    width: 156px;
-    min-width: 156px;
+    width: 62px;
+    min-width: 62px;
   }
 
-  .member {
-    grid-template-columns: auto minmax(0, 1fr);
+  .member-avatar {
+    width: 34px;
+    height: 34px;
+    font-size: 13px;
   }
 
   .member .badge {
-    grid-column: 1 / -1;
-    justify-self: start;
-    margin-left: 42px;
+    right: 2px;
   }
 
   .topbar-actions {
@@ -1874,8 +2095,8 @@ textarea:disabled {
   }
 
   .topbar .secondary {
-    min-height: 29px;
-    padding: 0 9px;
+    min-height: 28px;
+    padding: 0 10px;
     font-size: 11px;
   }
 
@@ -1885,8 +2106,13 @@ textarea:disabled {
 
   .mode-banner {
     justify-self: stretch;
-    width: auto;
+    width: 100%;
     text-align: center;
+  }
+
+  .messages {
+    padding: 8px 8px 10px;
+    gap: 7px;
   }
 
   .message {
@@ -1898,6 +2124,33 @@ textarea:disabled {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .composer {
+    padding:
+      6px
+      calc(8px + env(safe-area-inset-right))
+      calc(6px + env(safe-area-inset-bottom))
+      calc(8px + env(safe-area-inset-left));
+  }
+
+  .composer-pill {
+    grid-template-columns: 34px minmax(0, 1fr) 34px;
+  }
+
+  .emoji-button,
+  .attach-button {
+    width: 34px;
+    min-width: 34px;
+    min-height: 34px;
+    font-size: 18px;
+  }
+
+  .send-button {
+    width: 42px;
+    min-width: 42px;
+    min-height: 42px;
+    font-size: 18px;
   }
 
   .emoji-grid {
