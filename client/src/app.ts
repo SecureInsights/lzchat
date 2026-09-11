@@ -462,6 +462,9 @@ const MAX_RENDERED_MESSAGES = 500;
 // 避免每次全量重建数百行 DOM 与滚动位置重置。
 let messagesContainer: HTMLElement | null = null;
 let messagesContainerState: Runtime | null = null;
+// 输入进行中（composer 输入框聚焦）时的延迟全量重建：重建会搬动 composer 节点，
+// 关闭移动端软键盘并打断进行中的 IME 组合；期间消息行原位追加，待输入框失焦后补刷新。
+let deferredLayoutRefresh: { state: Runtime; options: RenderChatOptions } | null = null;
 // 行→消息 id 映射（用 WeakMap 而非 dataset：消息 id 含 ":"，超出 setDataset 的取值规则）。
 const messageRowIds = new WeakMap<HTMLElement, string>();
 // 消息→当前行元素映射：传输进度更新时直接改写对应气泡的进度条，无需重建整条消息列表。
@@ -948,6 +951,43 @@ function restoreComposerSnapshot(snapshot: ComposerSnapshot | null): void {
   );
 }
 
+function composerInputActive(): boolean {
+  const input = appRoot.querySelector<HTMLElement>(".composer-input");
+  return input !== null && document.activeElement === input;
+}
+
+function flushDeferredLayoutRefresh(): void {
+  const pending = deferredLayoutRefresh;
+  deferredLayoutRefresh = null;
+  if (pending !== null) {
+    renderChat(pending.options);
+  }
+}
+
+/**
+ * 消息接收路径的重建策略：用户正在输入（composer 输入框聚焦）时不做全量重建——
+ * 重建会搬动 composer 节点，移动端软键盘随之关闭、进行中的 IME 组合被打断。
+ * 期间消息行由调用方原位追加，顶栏/侧栏等布局刷新推迟到输入框失焦（flush）。
+ * 未输入时保持原行为：立即全量重建。
+ */
+function refreshLayoutOrDefer(options: RenderChatOptions = {}): void {
+  const state = runtime;
+  if (state === null) {
+    return;
+  }
+  if (deferredLayoutRefresh !== null) {
+    deferredLayoutRefresh = { state, options };
+    return;
+  }
+  if (!composerInputActive()) {
+    renderChat(options);
+    return;
+  }
+  const input = appRoot.querySelector<HTMLTextAreaElement>(".composer-input");
+  input?.addEventListener("blur", flushDeferredLayoutRefresh, { once: true });
+  deferredLayoutRefresh = { state, options };
+}
+
 function pushMessage(state: Runtime, message: ChatMessage): void {
   state.messages.push(message);
   if (state.messages.length > MAX_RENDERED_MESSAGES) {
@@ -1046,6 +1086,7 @@ function destroyRuntime(): void {
   runtime = null;
   messagesContainer = null;
   messagesContainerState = null;
+  deferredLayoutRefresh = null;
 }
 
 /**
@@ -1205,7 +1246,7 @@ function deleteIncomingFile(state: Runtime, key: string): void {
     if (placeholder) {
       placeholder.fileProgress = -1;
       placeholder.renderDirty = true;
-      renderChat();
+      refreshLayoutOrDefer();
     }
   }
 }
@@ -1891,7 +1932,10 @@ async function handlePlainPayload(
     }
     pushMessage(state, message);
     markIncomingUnread(state, message, peer.clientId);
-    renderChat();
+    if (composerInputActive()) {
+      appendMessageToRenderedList(state, message);
+    }
+    refreshLayoutOrDefer();
     notifyIncomingMessage(state, message);
     return;
   }
@@ -1922,7 +1966,10 @@ async function handlePlainPayload(
     }
     pushMessage(state, message);
     markIncomingUnread(state, message, peer.clientId);
-    renderChat();
+    if (composerInputActive()) {
+      appendMessageToRenderedList(state, message);
+    }
+    refreshLayoutOrDefer();
     notifyIncomingMessage(state, message);
     return;
   }
@@ -2010,11 +2057,14 @@ function handleFileMeta(
     if (existing && existing.fileProgress !== undefined) {
       state.messages[placeholderIndex] = placeholder;
       placeholder.renderDirty = true;
-      renderChat();
+      refreshLayoutOrDefer();
     }
   } else {
     pushMessage(state, placeholder);
-    renderChat();
+    if (composerInputActive()) {
+      appendMessageToRenderedList(state, placeholder);
+    }
+    refreshLayoutOrDefer();
   }
 }
 
@@ -2107,10 +2157,13 @@ async function handleFileDone(
     message.renderDirty = true;
   } else {
     pushMessage(state, message);
+    if (composerInputActive()) {
+      appendMessageToRenderedList(state, message);
+    }
   }
   deleteIncomingFile(state, key);
   markIncomingUnread(state, message, from);
-  renderChat();
+  refreshLayoutOrDefer();
   notifyIncomingMessage(state, message);
 }
 
@@ -5449,6 +5502,8 @@ function renderChat(options: RenderChatOptions = {}): void {
     renderLogin();
     return;
   }
+  // 全量重建已覆盖挂起的延迟刷新（如输入期间其他事件先触发了重建）。
+  deferredLayoutRefresh = null;
   const composerSnapshot = captureComposerSnapshot(state);
   const previousMessages = appRoot.querySelector<HTMLElement>(".messages");
   const savedScrollTop = previousMessages?.scrollTop ?? 0;
